@@ -123,6 +123,22 @@ def initialize_megatron(
             skip_model_parallel_init=skip_model_parallel_init,
         )
 
+        # MoonEP maps expert memory across each EP group and has no topology check of its own:
+        # fail fast, identically on every rank, before seeding and model construction.
+        if (
+            getattr(args, "moe_token_dispatcher_type", None) == "flex"
+            and getattr(args, "moe_flex_dispatcher_backend", None) == "moonep"
+            and mpu.model_parallel_is_initialized()
+        ):
+            from megatron.core.transformer.moe.moonep_backend.topology import (
+                assert_moonep_ep_group_nvlink_coverage,
+            )
+
+            assert_moonep_ep_group_nvlink_coverage(
+                mpu.get_expert_model_parallel_group(),
+                consensus_group=torch.distributed.group.WORLD,
+            )
+
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
         # vision encoder on rank 0 and the language model at --mimo-llm-offset, so that
         # alone would describe only the encoder; add the first LLM rank.

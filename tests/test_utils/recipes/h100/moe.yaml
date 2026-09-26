@@ -279,3 +279,10 @@ products:
       - environment: [dev]
         scope: [mr-broken]
         platforms: [dgx_h100]
+  # MoonEP flex backend. Disabled until the CI image ships the moonep package; re-enable by
+  # dropping "-broken" and record golden values from the first green run.
+  - test_case: [gpt3_mcore_te_moonep_ep8_1node, gpt3_mcore_te_moonep_ep8_resume_torch_dist_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github-broken]
+        platforms: [dgx_h100]

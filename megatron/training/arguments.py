@@ -1692,6 +1692,44 @@ def validate_args(args, defaults={}):
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
 
+    # MoonEP flex backend: size its token buffer and apply the training-only phase-1 limits.
+    # The model-level limits live in TransformerConfig._validate_moonep.
+    if args.moe_token_dispatcher_type == "flex" and args.moe_flex_dispatcher_backend == "moonep":
+        if args.moe_moonep_max_tokens_per_rank is None:
+            assert args.seq_length is not None, (
+                "MoonEP needs --seq-length to size its token buffer, or pass "
+                "--moe-moonep-max-tokens-per-rank."
+            )
+            max_tokens = args.seq_length * max(args.micro_batch_size, args.eval_micro_batch_size)
+            max_tokens //= args.context_parallel_size
+            if args.sequence_parallel:
+                max_tokens //= args.tensor_model_parallel_size
+            args.moe_moonep_max_tokens_per_rank = max_tokens
+        assert (
+            args.ckpt_format == "torch_dist"
+        ), "MoonEP (phase 1) supports only --ckpt-format torch_dist."
+        assert not args.data_parallel_random_init, (
+            "MoonEP does not support --data-parallel-random-init (it would bypass the bf16 "
+            "pool sync)."
+        )
+        assert not (
+            args.use_megatron_fsdp or args.use_torch_fsdp2
+        ), "MoonEP requires Megatron DDP (no FSDP)."
+        assert not args.freeze_all_layers, (
+            "MoonEP (phase 1) does not support --freeze-all-layers: expert masters are "
+            "requires_grad=False by design and would still be stepped (weight decay) by "
+            "MoonEPOptimizer."
+        )
+        assert not args.inprocess_restart, (
+            "MoonEP (phase 1) does not support --inprocess-restart: a MoonEP device trap "
+            "poisons the CUDA context, and Buffer teardown is collective."
+        )
+        assert not (args.overlap_grad_reduce or args.overlap_param_gather), (
+            "MoonEP (phase 1) requires --overlap-grad-reduce and --overlap-param-gather off: "
+            "concurrent NCCL kernels next to MoonEP's cooperative cross-rank barrier kernels "
+            "are untested."
+        )
+
     # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
     if args.ckpt_format == "torch_dcp":
         assert args.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."

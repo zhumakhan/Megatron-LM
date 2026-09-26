@@ -21,6 +21,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
+from megatron.core.transformer.moe.moonep_backend import uses_moonep
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -222,6 +223,8 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        if getattr(self.experts, "_is_moonep_experts", False):
+            self.experts.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):
@@ -367,12 +370,27 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = self.submodules.experts(
-            self.num_local_experts,
-            self.config,
-            pg_collection=pg_collection,
-            name=(name + ".experts") if name is not None else None,
-        )
+        if uses_moonep(self.config):
+            # MoonEP owns the expert weights (fp32 masters over bf16 VMM pools that peers
+            # prefetch from), so it builds its own experts instead of the spec's.
+            from megatron.core.transformer.moe.moonep_backend.experts import MoonEPGroupedMLP
+
+            self.experts = MoonEPGroupedMLP(
+                self.num_local_experts,
+                self.config,
+                pg_collection=pg_collection,
+                name=(name + ".experts") if name is not None else None,
+            )
+            self.token_dispatcher._comm_manager.bind_storage(self.experts.storage)
+            if layer_number is not None:
+                self.experts.set_layer_number(layer_number)
+        else:
+            self.experts = self.submodules.experts(
+                self.num_local_experts,
+                self.config,
+                pg_collection=pg_collection,
+                name=(name + ".experts") if name is not None else None,
+            )
 
         # Initialize shared experts
         if self.use_shared_expert:

@@ -322,6 +322,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed bit-exactly here.",
     ),
     KernelEntry(
+        name="moe_moonep",
+        sources=(
+            "megatron/core/transformer/moe/moonep_backend/autograd.py",
+            "megatron/core/transformer/moe/moonep_backend/experts.py",
+            "megatron/core/transformer/moe/moonep_backend/manager.py",
+        ),
+        tests=(K + "test_moonep_kernels.py",),
+        kind="external-lib",
+        notes="MoonEP flex backend: CuTe DSL dispatch/combine/prefetch/reduce_grad kernels and the "
+        "live-group torch._grouped_mm with fp32 dW accumulation. Replayed at kernel level "
+        "(single GPU) and as a MoELayer with balanced and skewed routing, zeroing with "
+        "zero_moe_grads() (skipped without moonep or >= 2 sm_90+ GPUs). test_moe_kernels.py also "
+        "replays it through the generic flex-moonep MoELayer cell.",
+    ),
+    KernelEntry(
         name="moe_shared_experts",
         sources=("megatron/core/transformer/moe/shared_experts.py",),
         kind="te-wrapper",

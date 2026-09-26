@@ -126,6 +126,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import DSAInde
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moonep_backend import uses_moonep
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -2273,12 +2274,26 @@ def pretrain(
         # process groups are destroyed make NCCL abort.
         deregister_and_clear_gtp_symm_pools()
 
+    _maybe_destroy_moonep_buffer(args)
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
     # OTel: close any still-open span (interval block / startup) and flush all pending
     # telemetry data.
     _end_otel_job_spans()
+
+
+def _maybe_destroy_moonep_buffer(args):
+    """Collectively destroy the MoonEP Buffer before the process groups go away.
+
+    Every rank reaches both call sites (the end of pretrain() and the exit branch of train()).
+    """
+    if uses_moonep(args):
+        from megatron.core.transformer.moe.moonep_backend.buffer import destroy_moonep_buffer
+
+        torch.cuda.synchronize()
+        destroy_moonep_buffer()
 
 
 def update_train_iters(args):
@@ -3318,6 +3333,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+        # MoonEP expert grads are persistent VMM storage: zeroed in place, never set to None.
+        if uses_moonep(config):
+            for model_chunk in model:
+                model_chunk.zero_moe_grads()
 
         if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
@@ -5553,6 +5572,7 @@ def train(
             # Deregister the GTP symmetric-memory pools: windows left registered when the
             # process groups are destroyed make NCCL abort.
             deregister_and_clear_gtp_symm_pools()
+        _maybe_destroy_moonep_buffer(args)
 
         for model_module in model:
             if isinstance(model_module, DDP):

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib.util
 import logging
 import math
 import os
@@ -985,11 +986,28 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep', 'moonep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
-    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
-    transformer_engine.pytorch.ep API."""
+    Options are "deepep", "hybridep", "ncclep", and "moonep". Currently only "hybridep" backend
+    supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
+    transformer_engine.pytorch.ep API. "moonep" uses MoonEP's NVLink dispatch/combine with expert
+    weight prefetching; it requires every expert-parallel group to live in one NVLink/NVSwitch
+    domain and builds its own grouped-GEMM experts with fp32 master weights."""
+
+    moe_moonep_max_tokens_per_rank: Optional[int] = None
+    """[Experimental] Token capacity S of the MoonEP communication buffer: the maximum number of
+    tokens one rank dispatches per MoE layer call. megatron/training derives it from
+    seq_length, micro-batch sizes, context parallelism and sequence parallelism when unset;
+    library users must set it."""
+
+    moe_moonep_token_padding: int = 128
+    """[Experimental] Every non-empty MoonEP expert segment is padded to a multiple of this many
+    tokens (``moonep.Buffer(token_padding=...)``)."""
+
+    moe_moonep_strict_zero_grad: bool = False
+    """[Experimental] Raise instead of warn on MoonEP expert-gradient lifecycle notices, for
+    example a forward that would accumulate into gradients that were not zeroed since the last
+    optimizer step."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1600,6 +1618,225 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_moonep(self) -> None:
+        """Validate the phase-1 envelope of the MoonEP flex dispatcher backend.
+
+        Pure (no GPU, no collectives, no ``moonep`` import): the config is rebuilt on every
+        micro-batch and in tests without a process group. The collective NVLink-coverage check
+        runs at initialization instead (``moonep_backend.topology``).
+        """
+        if self.moe_flex_dispatcher_backend != "moonep":
+            return
+
+        def req(ok: bool, msg: str) -> None:
+            if not ok:
+                raise ValueError(f"moe_flex_dispatcher_backend='moonep' requires {msg}")
+
+        req(
+            self.moe_token_dispatcher_type == "flex",
+            f"moe_token_dispatcher_type='flex', got '{self.moe_token_dispatcher_type}'.",
+        )
+        req(
+            self.num_moe_experts is not None,
+            "num_moe_experts to be set (MoonEP is an expert-parallel MoE backend).",
+        )
+        ep = self.expert_model_parallel_size
+        req(
+            1 < ep <= 128,
+            "1 < expert_model_parallel_size <= 128 (MoonEP moves tokens between EP ranks and "
+            f"its planner supports at most 128 ranks), got {ep}.",
+        )
+        req(
+            self.num_moe_experts % ep == 0,
+            f"num_moe_experts divisible by expert_model_parallel_size, got "
+            f"{self.num_moe_experts} % {ep} != 0.",
+        )
+        req(
+            self.expert_tensor_parallel_size == 1,
+            "expert_tensor_parallel_size == 1 (MoonEP moves whole experts; pass "
+            "--expert-tensor-parallel-size 1 explicitly when tensor_model_parallel_size > 1), "
+            f"got {self.expert_tensor_parallel_size}.",
+        )
+        req(
+            self.gtp_weight_remat_size == 1 and self.expert_gtp_weight_remat_size == 1,
+            "gtp_weight_remat_size == expert_gtp_weight_remat_size == 1 (the MoonEP gradient "
+            "scaling mirrors DDP without the GTP correction), got "
+            f"{self.gtp_weight_remat_size} and {self.expert_gtp_weight_remat_size}.",
+        )
+        req(
+            self.pipeline_model_parallel_size == 1,
+            "pipeline_model_parallel_size == 1 (phase 1 keeps one prefetch/reduce slot set per "
+            "layer; a second forward of a layer before its backward silently corrupts "
+            f"gradients), got {self.pipeline_model_parallel_size}.",
+        )
+        req(
+            self.virtual_pipeline_model_parallel_size is None,
+            "virtual_pipeline_model_parallel_size None (phase 1 keeps one prefetch/reduce slot "
+            f"set per layer), got {self.virtual_pipeline_model_parallel_size}.",
+        )
+        req(
+            self.bf16 and not self.fp16,
+            f"bf16=True and fp16=False (MoonEP kernels are bf16), got bf16={self.bf16}, "
+            f"fp16={self.fp16}.",
+        )
+        req(
+            self.gated_linear_unit and self.activation_func is F.silu,
+            "SwiGLU experts (gated_linear_unit=True and activation_func=F.silu, i.e. --swiglu), "
+            f"got gated_linear_unit={self.gated_linear_unit}, "
+            f"activation_func={getattr(self.activation_func, '__name__', self.activation_func)}.",
+        )
+        req(
+            self.glu_linear_offset == 0.0
+            and self.activation_func_clamp_value is None
+            and self.activation_func_tanh_clamp_scale is None
+            and self.activation_func_tanh_clamp_scale_linear is None
+            and self.moe_mlp_glu_interleave_size is None,
+            "a plain SwiGLU (glu_linear_offset == 0 and no activation clamps or GLU "
+            f"interleaving), got glu_linear_offset={self.glu_linear_offset}, "
+            f"activation_func_clamp_value={self.activation_func_clamp_value}, "
+            f"activation_func_tanh_clamp_scale={self.activation_func_tanh_clamp_scale}, "
+            "activation_func_tanh_clamp_scale_linear="
+            f"{self.activation_func_tanh_clamp_scale_linear}, "
+            f"moe_mlp_glu_interleave_size={self.moe_mlp_glu_interleave_size}.",
+        )
+        req(
+            not self.add_bias_linear,
+            "add_bias_linear=False (MoonEP experts have no bias; pass --disable-bias-linear).",
+        )
+        req(
+            self.moe_expert_capacity_factor is None
+            and not self.moe_pad_expert_input_to_capacity
+            and not self.moe_router_padding_for_quantization
+            and not self.moe_pad_experts_for_cuda_graph_inference,
+            "dropless routing with exactly moe_router_topk experts per token (no capacity "
+            "factor, capacity padding, quantization padding or CUDA-graph expert padding; "
+            "MoonEP planning traps on any other token count), got "
+            f"moe_expert_capacity_factor={self.moe_expert_capacity_factor}, "
+            f"moe_pad_expert_input_to_capacity={self.moe_pad_expert_input_to_capacity}, "
+            "moe_router_padding_for_quantization="
+            f"{self.moe_router_padding_for_quantization}, "
+            "moe_pad_experts_for_cuda_graph_inference="
+            f"{self.moe_pad_experts_for_cuda_graph_inference}.",
+        )
+        req(
+            self.fp8 is None and self.fp4 is None and not self.fp8_param,
+            f"bf16 expert compute (no fp8/fp4), got fp8={self.fp8}, fp4={self.fp4}, "
+            f"fp8_param={self.fp8_param}.",
+        )
+        req(
+            self.moe_router_dtype == "fp32",
+            "moe_router_dtype='fp32' (fp32 gating logits and routing weights, as in the MoonEP "
+            f"reference model; pass --moe-router-dtype fp32), got {self.moe_router_dtype}.",
+        )
+        req(
+            self.moe_latent_size is None
+            and not self.moe_apply_probs_on_input
+            and self.moe_num_hash_layers == 0,
+            "no MoE latent projections, probs-on-input or hash routing (they change the expert "
+            f"widths or the point where routing weights apply), got "
+            f"moe_latent_size={self.moe_latent_size}, "
+            f"moe_apply_probs_on_input={self.moe_apply_probs_on_input}, "
+            f"moe_num_hash_layers={self.moe_num_hash_layers}.",
+        )
+        req(
+            not self.moe_shared_expert_overlap,
+            "moe_shared_expert_overlap=False (overlapping shared experts on a side stream with "
+            "MoonEP's cross-rank barrier kernels is untested).",
+        )
+        req(
+            not self.overlap_moe_expert_parallel_comm
+            and not self.delay_wgrad_compute
+            and not self.overlap_dispatch_backward_with_experts_wgrad,
+            "no EP communication overlap or delayed weight-gradient computation (phase 1 keeps "
+            "one prefetch/reduce slot set per layer and computes dW inline), got "
+            f"overlap_moe_expert_parallel_comm={self.overlap_moe_expert_parallel_comm}, "
+            f"delay_wgrad_compute={self.delay_wgrad_compute}, "
+            "overlap_dispatch_backward_with_experts_wgrad="
+            f"{self.overlap_dispatch_backward_with_experts_wgrad}.",
+        )
+        req(
+            self.cuda_graph_impl == "none",
+            "cuda_graph_impl='none' (MoonEP kernels are shaped by the per-call token count), "
+            f"got '{self.cuda_graph_impl}'.",
+        )
+        recompute_modules = self.recompute_modules or []
+        req(
+            self.recompute_granularity != "full"
+            and not (
+                self.recompute_granularity == "selective"
+                and ("moe" in recompute_modules or "moe_act" in recompute_modules)
+            ),
+            "no MoE activation recompute ('full' and selective 'moe' re-run dispatch, planning "
+            "and prefetch inside backward; 'moe_act' is not implemented by MoonEP experts), got "
+            f"recompute_granularity={self.recompute_granularity}, "
+            f"recompute_modules={self.recompute_modules}.",
+        )
+        req(
+            not self.hybrid_context_parallel
+            and self.sequence_packing_scheduler is None
+            and not self.variable_seq_lengths,
+            "the same token count on every EP rank (no hybrid context parallelism, sequence "
+            f"packing or variable sequence lengths), got "
+            f"hybrid_context_parallel={self.hybrid_context_parallel}, "
+            f"sequence_packing_scheduler={self.sequence_packing_scheduler}, "
+            f"variable_seq_lengths={self.variable_seq_lengths}.",
+        )
+        req(
+            self.mlp_chunks_for_training == 1 and not self.mtp_use_repeated_layer,
+            "one call per MoE layer per micro-batch (mlp_chunks_for_training == 1 and "
+            f"mtp_use_repeated_layer=False), got mlp_chunks_for_training="
+            f"{self.mlp_chunks_for_training}, mtp_use_repeated_layer="
+            f"{self.mtp_use_repeated_layer}.",
+        )
+        req(
+            not self.cpu_offloading
+            and not self.fine_grained_activation_offloading
+            and not self.moe_paged_stash,
+            "no activation offloading or paged stashing (untested with VMM-backed expert "
+            f"memory), got cpu_offloading={self.cpu_offloading}, "
+            f"fine_grained_activation_offloading={self.fine_grained_activation_offloading}, "
+            f"moe_paged_stash={self.moe_paged_stash}.",
+        )
+        req(
+            not self.init_model_with_meta_device
+            and not self.use_cpu_initialization
+            and self.transformer_impl != "inference_optimized",
+            "GPU initialization at construction (MoonEP expert memory is VMM allocated and "
+            "mapped across the EP group), got "
+            f"init_model_with_meta_device={self.init_model_with_meta_device}, "
+            f"use_cpu_initialization={self.use_cpu_initialization}, "
+            f"transformer_impl='{self.transformer_impl}'.",
+        )
+        req(
+            not self.freeze_base_model_for_mtp,
+            "freeze_base_model_for_mtp=False (it sets requires_grad=True on MoonEP expert masters, "
+            "which must stay out of DDP).",
+        )
+        req(
+            self.hidden_size % 128 == 0
+            and self.moe_ffn_hidden_size is not None
+            and self.moe_ffn_hidden_size % 128 == 0,
+            "hidden_size and moe_ffn_hidden_size to be multiples of 128 (MoonEP prefetch and "
+            f"grad-reduce tiles), got {self.hidden_size} and {self.moe_ffn_hidden_size}.",
+        )
+        req(
+            1 <= self.moe_router_topk <= 32,
+            f"1 <= moe_router_topk <= 32 (MoonEP planner limit), got {self.moe_router_topk}.",
+        )
+        req(
+            self.moe_moonep_max_tokens_per_rank is None or self.moe_moonep_max_tokens_per_rank > 0,
+            "moe_moonep_max_tokens_per_rank None or > 0, got "
+            f"{self.moe_moonep_max_tokens_per_rank}.",
+        )
+        req(
+            self.moe_moonep_token_padding >= 1,
+            f"moe_moonep_token_padding >= 1, got {self.moe_moonep_token_padding}.",
+        )
+        req(
+            importlib.util.find_spec("moonep") is not None,
+            "the moonep package (https://github.com/zhumakhan/MoonEP) to be installed.",
+        )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -2057,6 +2294,13 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
         if self.moe_single_grouped_bias and not self.moe_use_grouped_tensor:
             raise ValueError("moe_single_grouped_bias requires moe_use_grouped_tensor=True.")
+
+        # The deprecated flag below silently rewrites the backend to 'deepep'.
+        if self.moe_enable_deepep and self.moe_flex_dispatcher_backend == "moonep":
+            raise ValueError(
+                "moe_enable_deepep forces the 'deepep' flex backend; remove --moe-enable-deepep "
+                "when using --moe-flex-dispatcher-backend moonep."
+            )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -3812,6 +4056,10 @@ class TransformerConfig(ModelParallelConfig):
                     f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+
+        # Last, so it sees the resolved expert TP size, recompute settings, capacity factor and
+        # moe_ffn_hidden_size.
+        self._validate_moonep()
 
 
 @dataclass

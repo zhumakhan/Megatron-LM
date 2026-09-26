@@ -1860,10 +1860,26 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+        elif self.config.moe_flex_dispatcher_backend == "moonep":
+            from megatron.core.transformer.moe.moonep_backend.manager import _MoonEPManager
+
+            assert self.tp_size == 1 and self.ep_size > 1, (
+                "MoonEP dispatcher requires expert_tensor_parallel_size == 1 and "
+                "expert_model_parallel_size > 1"
+            )
+            # MoELayer binds the experts' VMM storage once the experts exist.
+            self._comm_manager = _MoonEPManager(
+                group=self.ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.config.moe_router_topk,
+                num_experts=self.config.num_moe_experts,
+                config=self.config,
+            )
+            self.cudagraph_attrs = []
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
+                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, ncclep, or moonep"
             )
 
     def get_expert_zero_copy_buffers(self):

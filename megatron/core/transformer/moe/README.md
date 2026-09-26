@@ -309,7 +309,28 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **FlexDispatcher with [MoonEP](https://github.com/zhumakhan/MoonEP) backend (experimental)** | NVLink symmetric-memory dispatch/combine that balances load by prefetching hot remote experts into local slots; fp32 master weights over bf16 VMM expert pools | Single NVLink domain (e.g. 8x B200), skewed routing | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend moonep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+
+#### FlexDispatcher with the MoonEP backend (experimental)
+
+[MoonEP](https://github.com/zhumakhan/MoonEP) moves tokens over NVLink with symmetric-memory kernels and evens out expert load by copying the weights of overloaded remote experts into local prefetch slots; the copies' weight gradients are reduced back to their owners every micro-batch. The backend builds its own grouped-GEMM SwiGLU experts (`MoonEPGroupedMLP`) instead of the spec's: the optimizer steps fp32 master weights while the forward and backward run on bf16 copies in VMM memory that peers read over NVLink.
+
+```bash
+--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend moonep
+--expert-model-parallel-size 8 --expert-tensor-parallel-size 1
+--bf16 --swiglu --disable-bias-linear --moe-router-dtype fp32
+--ckpt-format torch_dist
+# optional: --moe-moonep-max-tokens-per-rank (derived from --seq-length and the micro-batch
+#   sizes when unset), --moe-moonep-token-padding (default 128),
+#   --moe-flex-dispatcher-num-sms (default 32), --moe-moonep-strict-zero-grad
+```
+
+- **Topology.** Every expert-parallel group must be one NVLink/NVSwitch domain with NVSwitch multicast (sm_90 or newer). `initialize_megatron` checks this on every rank right after the process groups exist (NVML NVLink P2P status for same-host pairs, fabric clique and health for cross-host pairs, and the memory-handle path MoonEP will use) and raises the same actionable error everywhere if any EP group fails.
+- **Phase-1 limits** (rejected at config construction or `validate_args`): PP=1 without VPP, ETP=1, SwiGLU without bias, dropless routing, bf16, fp32 router, no EP-communication overlap or delayed wgrad, no MoE activation recompute, no CUDA graphs, no shared-expert overlap, `torch_dist` checkpoints, Adam, Megatron DDP with `--overlap-grad-reduce` and `--overlap-param-gather` off, no inference engines, no in-process restart and no freezing flags. `hidden_size` and `moe_ffn_hidden_size` must be multiples of 128, and one expert chunk (`num_experts/EP * hidden_size * moe_ffn_hidden_size * 2` bytes) must be a multiple of the VMM granularity (2 MiB on B200).
+- **Gradients.** The expert masters are `requires_grad=False` parameters whose `.grad` and `.main_grad` permanently alias persistent fp32 VMM storage, so they are never set to None: `train_step` zeroes them in place with `model.zero_moe_grads()` right after `optimizer.zero_grad()`, and `finalize_model_grads` applies DDP's expert scaling and expert-data-parallel reduction to them. Library users must do both; a forward that would add to non-zeroed gradients logs a warning on every occurrence (or raises with `--moe-moonep-strict-zero-grad`). `get_megatron_optimizer` appends a `MoonEPOptimizer` last to the chained optimizer; it shares the joint gradient-norm clipping and refreshes the bf16 copies after every step.
+- **Checkpoints.** MoonEP experts save under the same keys, shapes and fragment layout as `SequentialMLP`/`TEGroupedMLP`, so `torch_dist` checkpoints load in either direction (the fp32 masters load bf16 weights exactly and save as fp32). Optimizer states are not interchangeable across backends.
+- **Library users** without `initialize_megatron` must set `moe_moonep_max_tokens_per_rank`, and should call `megatron.core.transformer.moe.moonep_backend.buffer.destroy_moonep_buffer()` on every rank before destroying the process groups.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.

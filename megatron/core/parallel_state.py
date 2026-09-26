@@ -2514,6 +2514,19 @@ def destroy_model_parallel():
         nccl_ep_finalize()
     except Exception:  # finalize must never block teardown
         pass
+    # Drop the MoonEP Buffer and topology cache without the collective Buffer.destroy(): the
+    # only production caller of this function is the in-process-restart fault path, where peers
+    # may be gone. The collective destroy runs at the end of pretrain().
+    try:
+        from megatron.core.transformer.moe.moonep_backend.buffer import release_moonep_buffer
+        from megatron.core.transformer.moe.moonep_backend.topology import (
+            _reset_moonep_topology_cache,
+        )
+
+        release_moonep_buffer()
+        _reset_moonep_topology_cache()
+    except Exception:  # release must never block teardown
+        pass
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None

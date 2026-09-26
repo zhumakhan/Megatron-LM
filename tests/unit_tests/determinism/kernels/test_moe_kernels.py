@@ -11,6 +11,8 @@ the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
 ``fused_a2a.py`` when the dependency and the GPUs are available).
 """
 
+import importlib.util
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -50,6 +52,8 @@ HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
+
+HAVE_MOONEP = importlib.util.find_spec("moonep") is not None
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
@@ -541,6 +545,20 @@ class TestMoEModules:
                 id="flex-deepep-ep2",
                 marks=pytest.mark.skipif(not HAVE_DEEP_EP, reason="DeepEP not installed"),
             ),
+            pytest.param(
+                "flex",
+                2,
+                {
+                    "moe_flex_dispatcher_backend": "moonep",
+                    "moe_moonep_max_tokens_per_rank": 4096,
+                    "use_cpu_initialization": False,
+                },
+                id="flex-moonep-ep2",
+                marks=pytest.mark.skipif(
+                    not HAVE_MOONEP or torch.cuda.get_device_capability()[0] < 9,
+                    reason="MoonEP not installed or GPU older than sm_90",
+                ),
+            ),
         ],
     )
     def test_moe_layer_replays(self, dispatcher, ep, extra):
@@ -571,6 +589,16 @@ class TestMoEModules:
             input_ids = torch.arange(4096, device="cuda").view(2, 2048) % config.hash_moe_vocab_size
             inputs = {"hidden_states": hidden, "input_ids": input_ids}
         with deterministic_algorithms(True):
+            # The harness zeroes grads with zero_grad(set_to_none=True) plus main_grad.zero_();
+            # MoonEP re-binds its masters' grad aliases on the next forward (with a notice) and
+            # the main_grad views are its persistent grads, so the replay still compares them.
             assert_module_replays_bit_exact(
                 layer, inputs, replays=3, contention=True, what=f"MoELayer[{dispatcher}, ep={ep}]"
             )
+        if config.moe_flex_dispatcher_backend == "moonep":
+            from megatron.core.transformer.moe.moonep_backend.buffer import destroy_moonep_buffer
+
+            del layer
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            destroy_moonep_buffer()
