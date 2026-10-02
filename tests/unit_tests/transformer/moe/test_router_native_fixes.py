@@ -4,6 +4,7 @@
 
 - Router gating with input and weight dtypes that differ.
 - Router gating, the router and the shared experts on 0 tokens.
+- Top-k probabilities that do not depend on the grad mode.
 
 `_ReferenceRouter` is a verbatim copy of a downstream router that these fixes let `TopKRouter`
 replace bit for bit.
@@ -17,12 +18,14 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     router_gating_linear,
+    topk_routing_with_score_function,
 )
 from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
@@ -137,13 +140,13 @@ class TestRouterNativeFixes:
             (torch.bfloat16, torch.bfloat16),
         ],
     )
-    @pytest.mark.parametrize("grad", [True])
+    @pytest.mark.parametrize("grad", [True, False])
     @pytest.mark.parametrize("num_tokens", [4096, 0])
     def test_topk_router_matches_reference_router(
         self, score_function, input_dtype, params_dtype, grad, num_tokens
     ):
-        """Mixed-dtype gating casts the input to the weight dtype first and 0 tokens work without
-        padding; all bitwise as the reference."""
+        """Mixed-dtype gating casts the input to the weight dtype first, the top-k is sorted
+        without grad as well, and 0 tokens work without padding; all bitwise as the reference."""
         config = _config(params_dtype, moe_router_score_function=score_function)
         router = _router(config)
         reference = _router(config, _ReferenceRouter)
@@ -218,6 +221,43 @@ class TestRouterNativeFixes:
         assert len(fired) == 1 and torch.equal(fired[0], torch.zeros_like(weight))
         if with_bias:
             assert torch.equal(bias.grad, torch.zeros_like(bias))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("score_function", ["sigmoid", "sqrtsoftplus"])
+    def test_topk_probs_do_not_depend_on_grad_mode(self, score_function):
+        logits = torch.randn(32768, NUM_EXPERTS, device="cuda") * 2
+        expert_bias = torch.randn(NUM_EXPERTS, device="cuda") * 0.05
+        kwargs = dict(
+            topk=TOPK,
+            score_function=score_function,
+            expert_bias=expert_bias,
+            scaling_factor=2.5,
+            dense_output=True,
+        )
+        with torch.enable_grad():
+            probs, indices = topk_routing_with_score_function(logits, **kwargs)
+        with torch.no_grad():
+            no_grad_probs, no_grad_indices = topk_routing_with_score_function(logits, **kwargs)
+        assert torch.equal(no_grad_indices, indices)
+        assert torch.equal(no_grad_probs, probs)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_topk_is_unsorted_only_in_inference_mode(self, monkeypatch):
+        sorted_flags = []
+        topk = torch.topk
+
+        def spy(*args, **kwargs):
+            sorted_flags.append(kwargs.get("sorted", True))
+            return topk(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "topk", spy)
+        logits = torch.randn(16, NUM_EXPERTS, device="cuda")
+        with torch.no_grad():
+            topk_routing_with_score_function(logits, TOPK, score_function="sigmoid")
+            with InferenceMode.active():
+                topk_routing_with_score_function(logits, TOPK, score_function="sigmoid")
+        topk_routing_with_score_function(logits, TOPK, score_function="sigmoid")
+        assert sorted_flags == [True, False, True]
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("load_balancing_type", ["none"])

@@ -11,6 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
@@ -877,12 +878,15 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            # Sorting top-k turned off during inference
+            # The order of the selected experts sets the summation order of the probability
+            # normalization, so an unsorted top-k changes the probs by a few ulps. Sort unless an
+            # inference engine is using the model, so that no-grad passes (evaluation, an EMA
+            # teacher, the first pass of activation recomputation) match the grad pass.
             return torch.topk(
                 scores,
                 k=topk,
                 dim=1,
-                sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
+                sorted=not InferenceMode.is_active() or is_batch_invariant_mode_enabled(),
             )
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
