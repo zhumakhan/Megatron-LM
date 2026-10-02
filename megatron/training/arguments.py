@@ -3477,7 +3477,9 @@ def _add_distributed_args(parser):
                        'Set to enable FSDP ZeRO-2.')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
                        help='Inter-gpu communication type for context parallelism: '
-                       'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '
+                       'p2p, a2a, allgather, a2a+p2p or ulysses (Megatron-side Ulysses for '
+                       'non-causal self-attention; requires contiguous CP sequence sharding, '
+                       'see TransformerConfig.cp_comm_type). If a single string is provided, '
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
