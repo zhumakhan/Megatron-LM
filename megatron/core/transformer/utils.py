@@ -5,6 +5,8 @@
 import gc
 import logging
 import os
+from collections import OrderedDict
+from dataclasses import dataclass
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -110,6 +112,146 @@ def get_sliding_window_causal_mask(sq, skv, window_size):
 def attention_mask_func(attention_scores, attention_mask):
     attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
+
+
+def check_key_padding_mask(attention_mask: torch.Tensor) -> None:
+    """Check that ``attention_mask`` is a ``[b, 1, 1, sk]`` boolean key-padding mask."""
+    assert (
+        attention_mask.dim() == 4
+        and attention_mask.shape[1] == 1
+        and attention_mask.shape[2] == 1
+        and attention_mask.dtype == torch.bool
+    ), (
+        "AttnMaskType.key_padding expects a [b, 1, 1, sk] bool attention mask, got "
+        f"{tuple(attention_mask.shape)} {attention_mask.dtype}"
+    )
+
+
+def key_padding_safe_mask(attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Make every row of a key-padding mask attend to at least one key.
+
+    Args:
+        attention_mask (Tensor): ``[b, 1, 1, sk]`` boolean key-padding mask, True = ignore key.
+
+    Returns:
+        Tuple of the mask with key 0 unmasked for samples without any valid key, and the
+        ``[b, 1, 1, 1]`` boolean flags of those samples. Their attention output must be zeroed
+        by the caller.
+    """
+    empty = attention_mask.all(dim=-1, keepdim=True)
+    first = torch.arange(attention_mask.shape[-1], device=attention_mask.device) == 0
+    return attention_mask & ~(empty & first), empty
+
+
+@dataclass(frozen=True)
+class KeyPaddingMetadata:
+    """Varlen (THD) layout of a ``[b, 1, 1, sk]`` key-padding mask.
+
+    Every query is kept and the keys/values of each sample are compacted to its valid positions.
+    Samples without any valid key keep key 0 (see :func:`key_padding_safe_mask`); their output
+    rows must be zeroed with :attr:`empty`.
+    """
+
+    sbhd_kv_index: torch.Tensor
+    """int64 ``[nnz]``: kept rows of the ``[sk * b, ...]`` view of an ``[sk, b, ...]`` key or
+    value tensor, in sample-major (THD) order."""
+
+    bshd_kv_index: torch.Tensor
+    """int64 ``[nnz]``: kept rows of the ``[b * sk, ...]`` view of a ``[b, sk, ...]`` key or
+    value tensor, in sample-major (THD) order."""
+
+    cu_seqlens_q: torch.Tensor
+    """int32 ``[b + 1]``: cumulative query lengths, ``arange(b + 1) * sq``."""
+
+    cu_seqlens_kv: torch.Tensor
+    """int32 ``[b + 1]``: cumulative numbers of kept keys."""
+
+    empty: torch.Tensor
+    """bool ``[b, 1, 1, 1]``: samples without any valid key."""
+
+
+_KEY_PADDING_METADATA_CACHE_SIZE = 8
+_key_padding_metadata_cache: "OrderedDict[tuple, Tuple[torch.Tensor, KeyPaddingMetadata]]" = (
+    OrderedDict()
+)
+
+
+def clear_key_padding_metadata_cache() -> None:
+    """Drop all cached key-padding metadata and the masks the cache keeps alive."""
+    _key_padding_metadata_cache.clear()
+
+
+def _build_key_padding_metadata(
+    attention_mask: torch.Tensor, query_length: int
+) -> KeyPaddingMetadata:
+    batch, key_length = attention_mask.shape[0], attention_mask.shape[-1]
+    safe_mask, empty = key_padding_safe_mask(attention_mask)
+    valid = ~safe_mask[:, 0, 0]
+    lengths = valid.sum(dim=-1, dtype=torch.int32)
+    cu_seqlens_kv = torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))
+    cu_seqlens_q = (
+        torch.arange(batch + 1, device=attention_mask.device, dtype=torch.int32) * query_length
+    )
+    # The only host synchronization: nonzero() needs the number of kept keys.
+    bshd_kv_index = valid.reshape(-1).nonzero().squeeze(1)
+    sbhd_kv_index = (bshd_kv_index % key_length) * batch + torch.div(
+        bshd_kv_index, key_length, rounding_mode="floor"
+    )
+    return KeyPaddingMetadata(
+        sbhd_kv_index=sbhd_kv_index,
+        bshd_kv_index=bshd_kv_index,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        empty=empty,
+    )
+
+
+def get_key_padding_metadata(attention_mask: torch.Tensor, query_length: int) -> KeyPaddingMetadata:
+    """Return the varlen (THD) metadata of a key-padding mask, computed once per mask.
+
+    The metadata is cached on the mask storage (data pointer, version counter, shape, strides,
+    device), so every layer that receives the same mask, and the activation-checkpoint
+    recompute (which receives detached aliases of the same storage), reuse a single
+    ``nonzero`` and its device-to-host synchronization. A cached mask is kept alive, so its
+    storage cannot be reused by another tensor while the entry exists, and in-place updates of
+    the mask (or of a view of it) bump its version and invalidate the entry.
+
+    Args:
+        attention_mask (Tensor): ``[b, 1, 1, sk]`` boolean mask, True = ignore that key.
+        query_length (int): number of queries per sample.
+    """
+    check_key_padding_mask(attention_mask)
+    if attention_mask.is_inference():
+        # Inference tensors have no version counter to validate a cache entry with.
+        return _build_key_padding_metadata(attention_mask, query_length)
+    key = (
+        attention_mask.data_ptr(),
+        attention_mask._version,
+        tuple(attention_mask.shape),
+        attention_mask.stride(),
+        attention_mask.device,
+        query_length,
+    )
+    entry = _key_padding_metadata_cache.get(key)
+    if entry is not None:
+        _key_padding_metadata_cache.move_to_end(key)
+        return entry[1]
+    metadata = _build_key_padding_metadata(attention_mask, query_length)
+    _key_padding_metadata_cache[key] = (attention_mask.detach(), metadata)
+    while len(_key_padding_metadata_cache) > _KEY_PADDING_METADATA_CACHE_SIZE:
+        _key_padding_metadata_cache.popitem(last=False)
+    return metadata
+
+
+def key_padding_pack(tensor: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
+    """Gather the kept rows of an sbhd or bshd key or value tensor into THD ``[nnz, h, d]``.
+
+    Args:
+        tensor (Tensor): key or value tensor, ``[sk, b, h, d]`` or ``[b, sk, h, d]``.
+        kv_index (Tensor): the matching :attr:`KeyPaddingMetadata.sbhd_kv_index` or
+            :attr:`KeyPaddingMetadata.bshd_kv_index` of the key-padding mask.
+    """
+    return tensor.reshape(-1, *tensor.shape[2:]).index_select(0, kv_index)
 
 
 @jit_fuser

@@ -500,6 +500,32 @@ class TestTEWrappers:
                 pytest.skip(f"TE has no {backend} attention backend here: {error}")
             raise
 
+    def test_te_dot_product_attention_key_padding_replays(self, monkeypatch):
+        """AttnMaskType.key_padding: a key mask with a hole becomes a THD varlen call (GQA)."""
+        seeded()
+        clear_nvte_env_vars()
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        module = TEDotProductAttention(
+            _config(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.key_padding,
+            attention_type="self",
+        ).cuda()
+        s, b, h, hkv, d = 4096, 2, 16, 4, 128
+        q = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        # Sample 0: [512 valid | 1536 masked | 2048 valid] keys; sample 1: all keys valid.
+        mask = torch.zeros(b, 1, 1, s, dtype=torch.bool, device="cuda")
+        mask[0, ..., 512:2048] = True
+
+        def fn(q, k, v):
+            return module(q, k, v, mask, AttnMaskType.key_padding)
+
+        assert_replays_bit_exact(
+            fn, (q, k, v), replays=4, contention=True, what="TEDotProductAttention[key_padding]"
+        )
+
 
 # --- fused RoPE --------------------------------------------------------------------------------
 

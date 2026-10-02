@@ -17,6 +17,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     attention_mask_func,
+    check_key_padding_mask,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
@@ -37,6 +38,9 @@ class DotProductAttention(MegatronModule):
      p: number of tensor model parallel partitions
      b: batch size
      s: sequence length
+
+    AttnMaskType.key_padding masks (``[b, 1, 1, sk]``) are broadcast over the queries like an
+    arbitrary mask, and the output rows of samples without a valid key are zeroed.
     """
 
     def __init__(
@@ -164,6 +168,16 @@ class DotProductAttention(MegatronModule):
         )
         assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
+        empty_samples = None
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+        if attn_mask_type == AttnMaskType.key_padding and attention_mask is not None:
+            # A [b, 1, 1, sk] key mask: broadcast it over the queries (the fused softmax kernel
+            # reads a dense [b, 1, sq, sk] mask) and zero the rows of samples without valid keys.
+            check_key_padding_mask(attention_mask)
+            empty_samples = attention_mask.all(dim=-1).view(1, -1, 1)
+            attention_mask = attention_mask.expand(-1, -1, query.size(0), -1).contiguous()
+
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
         # ===================================
@@ -261,6 +275,9 @@ class DotProductAttention(MegatronModule):
         # [sq, b, np, hn] --> [sq, b, hp]
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.view(*new_context_shape)
+
+        if empty_samples is not None:
+            context = context.masked_fill(empty_samples, 0)
 
         return context
 
