@@ -981,6 +981,18 @@ class TransformerConfig(ModelParallelConfig):
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
     a corresponding list of coefficients should be provided here."""
 
+    moe_seq_aux_loss_normalization: Literal['batch_mean', 'per_sequence'] = 'batch_mean'
+    """How the "seq_aux_loss" load balancing loss normalizes over the tokens of each sequence.
+    - "batch_mean": The sequences are the batch entries of the [seq_length, batch] router input,
+    and all of them are normalized by the mean number of valid tokens per sequence.
+    - "per_sequence": Every sequence b is normalized by its own number of valid tokens T_b:
+    loss = coeff * mean_b sum_e (E * c_be / (topk * T_b)) * (P_be / T_b), where c_be counts the
+    valid tokens of b whose top-k of the raw scores (without expert bias) contains expert e, and
+    P_be sums the scores of b normalized over all experts. Counts, sums and T_b are reduced over
+    the tensor- and context-parallel ranks and padding tokens are excluded. The sequences can be
+    given explicitly with the `sequence_ids` and `num_sequences` arguments of `MoELayer.forward`
+    (e.g. for packed or compacted router inputs); they default to the batch entries."""
+
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
 
@@ -2458,6 +2470,12 @@ class TransformerConfig(ModelParallelConfig):
             ) == len(self.moe_router_load_balancing_type), (
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
+            )
+
+        if self.moe_seq_aux_loss_normalization not in ("batch_mean", "per_sequence"):
+            raise ValueError(
+                "moe_seq_aux_loss_normalization must be 'batch_mean' or 'per_sequence', "
+                f"got {self.moe_seq_aux_loss_normalization!r}."
             )
 
         if self.moe_expert_capacity_factor is not None:

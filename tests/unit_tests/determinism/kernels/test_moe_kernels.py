@@ -255,6 +255,28 @@ def test_switch_load_balancing_loss_replays(fused):
     assert_replays_bit_exact(fn, (probs,), replays=4, what=f"aux loss[fused={fused}]")
 
 
+@pytest.mark.parametrize("with_padding", [False, True])
+def test_per_sequence_load_balancing_loss_replays_under_deterministic_algorithms(with_padding):
+    """Per-sequence aux loss: int64 counts and fp32 probability sums accumulated by index_add."""
+    seeded()
+    num_tokens, num_sequences = 65536, 16
+    probs = torch.softmax(torch.randn(num_tokens, 256, device="cuda"), dim=-1)
+    probs.requires_grad_(True)
+    top_indices = probs.detach().topk(8, dim=-1).indices
+    sequence_ids = torch.randint(0, num_sequences, (num_tokens,), device="cuda")
+    padding_mask = torch.rand(num_tokens, device="cuda") < 0.1 if with_padding else None
+
+    def fn(probs):
+        return moe_utils.per_sequence_load_balancing_loss_func(
+            probs, top_indices, sequence_ids, num_sequences, 8, 256, 1e-2, padding_mask=padding_mask
+        )
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(
+            fn, (probs,), replays=4, what=f"per-sequence aux loss[padding={with_padding}]"
+        )
+
+
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_router_gating_linear_replays(router_dtype, with_bias):
