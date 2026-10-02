@@ -358,6 +358,27 @@ def check_ulysses_attn_mask_type(attn_mask_type: AttnMaskType) -> None:
         )
 
 
+def check_ulysses_attention_type(attention_type: str) -> None:
+    """Reject the attention types that ``cp_comm_type='ulysses'`` does not support.
+
+    Ulysses exchanges keys and values over the context-parallel group exactly like the queries,
+    so they must be sharded along the sequence like the queries, which holds for self-attention
+    only. The keys and values of cross-attention come from a context that is not sharded that way
+    (the keys and values of a replicated context would be duplicated ``cp`` times, and masks
+    sized to the context would not match).
+
+    Args:
+        attention_type (str): attention type of the layer, "self" or "cross".
+    """
+    if attention_type != "self":
+        raise ValueError(
+            "cp_comm_type='ulysses' supports self-attention only, got "
+            f"attention_type={attention_type!r}: it gathers the keys and values over the "
+            "context-parallel group like the queries, so they must be sharded along the sequence "
+            "like the queries."
+        )
+
+
 def ulysses_attention(
     attention_fn: Callable[..., torch.Tensor],
     query: torch.Tensor,
@@ -370,25 +391,28 @@ def ulysses_attention(
     """Run ``attention_fn`` on the full sequence with heads split across the CP group (Ulysses).
 
     Contract: the sequence dimension (dim 0) of ``query``/``key``/``value`` is sharded
-    contiguously across ``cp_group`` (rank ``r`` holds positions ``[r * s, (r + 1) * s)``), and
-    every tensor argument of ``attention_fn`` that covers the sequence, such as the attention
-    mask, is CP-global.
+    contiguously across ``cp_group``: with ``s`` the length of the full sequence and ``cp`` the
+    size of ``cp_group``, rank ``r`` holds positions ``[r * s / cp, (r + 1) * s / cp)``. Every
+    tensor argument of ``attention_fn`` that covers the sequence, such as the attention mask, is
+    CP-global.
 
     Args:
         attention_fn (Callable): attention kernel called as
-            ``attention_fn(query, key, value, *args, **kwargs)`` on ``[s * cp, b, h / cp, d]``
-            inputs; it returns ``[s * cp, b, h / cp * d]``.
-        query, key, value (Tensor): ``[s, b, h, d]`` local sequence shards.
+            ``attention_fn(query, key, value, *args, **kwargs)`` on ``[s, b, h / cp, d]`` inputs;
+            it returns ``[s, b, h / cp * d]``.
+        query, key, value (Tensor): ``[s / cp, b, h, d]`` local sequence shards. The number of
+            heads ``h`` may differ between the query and the key/value (grouped-query attention)
+            and must be divisible by ``cp``.
         cp_group (ProcessGroup): context-parallel group.
 
     Returns:
-        Tensor: ``[s, b, h * d]`` attention output of the local sequence shard.
+        Tensor: ``[s / cp, b, h * d]`` attention output of the local sequence shard.
     """
 
     cp_size = cp_group.size()
 
     def scatter_heads(tensor: torch.Tensor) -> torch.Tensor:
-        # [s, b, h, d] -> [s * cp, b, h / cp, d]: gather the sequence, keep 1 / cp of the heads.
+        # [s / cp, b, h, d] -> [s, b, h / cp, d]: gather the sequence, keep 1 / cp of the heads.
         heads, head_dim = tensor.shape[-2:]
         assert heads % cp_size == 0, f"{heads} heads cannot be split across {cp_size} CP ranks"
         exchanged = all_to_all_sp2hp(tensor.flatten(-2), group=cp_group)
@@ -399,7 +423,7 @@ def ulysses_attention(
     output = attention_fn(
         scatter_heads(query), scatter_heads(key), scatter_heads(value), *args, **kwargs
     )
-    # [s * cp, b, h / cp * d] -> [s, b, h * d]
+    # [s, b, h / cp * d] -> [s / cp, b, h * d]
     return all_to_all_hp2sp(output, group=cp_group).view(*query.shape[:-2], -1)
 
 

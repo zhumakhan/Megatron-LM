@@ -353,6 +353,26 @@ class TestUlyssesAttention:
         # Without context parallelism, cp_comm_type='ulysses' leaves causal attention alone.
         _te_attention(_config(1, 1, cp_comm_type="ulysses"), attn_mask_type, "ulysses")
 
+    def test_rejects_cross_attention(self, monkeypatch):
+        """Ulysses exchanges keys and values like the queries, which fits self-attention only."""
+        self._initialize(1, 2, monkeypatch)
+
+        def cross_attention(core_attention, cp):
+            return core_attention(
+                config=_config(1, cp, cp_comm_type="ulysses"),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.no_mask,
+                attention_type="cross",
+                cp_comm_type="ulysses",
+                pg_collection=_pg_collection(),
+            )
+
+        for core_attention in (TEDotProductAttention, DotProductAttention):
+            with pytest.raises(ValueError, match="self-attention only"):
+                cross_attention(core_attention, cp=2)
+            # Without context parallelism, cross-attention is built as usual.
+            cross_attention(core_attention, cp=1)
+
     def test_key_padding_rejects_te_context_parallelism(self, monkeypatch):
         """key_padding uses cp_comm_type='ulysses' for CP; TE's own CP cannot take the mask."""
         self._initialize(1, 2, monkeypatch)
