@@ -189,7 +189,6 @@ class TestUlyssesAttention:
             attn_mask_type=AttnMaskType.key_padding,
         )
         config = _config(1, cp, **options)
-        config.model_args = {}
         reference = _run(
             DiTMaskedAttention(
                 attention_type="self",
@@ -259,7 +258,6 @@ class TestUlyssesAttention:
             k_layernorm=TENorm,
         )
         reference_config = _config(1, cp, **options)
-        reference_config.model_args = {}
         reference = DiTSelfAttention(
             config=reference_config,
             submodules=SelfAttentionSubmodules(core_attention=DiTMaskedAttention, **submodules),

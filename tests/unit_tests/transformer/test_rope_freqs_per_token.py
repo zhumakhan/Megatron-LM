@@ -258,7 +258,6 @@ class TestRopeFreqsPerToken:
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         reference_config = _config(**options)
-        reference_config.model_args = {}
         reference = DiTSelfAttention(
             config=reference_config,
             submodules=SelfAttentionSubmodules(core_attention=DiTMaskedAttention, **submodules),

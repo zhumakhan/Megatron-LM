@@ -74,7 +74,6 @@ def _te_attention(config, attn_mask_type=AttnMaskType.key_padding):
 
 
 def _reference_attention(config):
-    config.model_args = {}
     return DiTMaskedAttention(
         attention_type="self",
         config=config,
