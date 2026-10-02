@@ -291,7 +291,7 @@ class TestPerSequenceSeqAuxLoss:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_default_sequences_are_the_batch_entries(self):
         """Without sequence_ids, token i of the flattened [seq, batch] input is in sequence
-        i % batch."""
+        i % batch. int32 ids work like int64 ids."""
         self._init(2, 2)
         router = _make_router()
         seq_length, batch = 32, 3
@@ -300,11 +300,16 @@ class TestPerSequenceSeqAuxLoss:
         ids = torch.arange(valid.numel(), device="cuda") % batch
         with _deterministic_algorithms():
             implicit = _aux_value_and_grad(router, logits, padding_mask=~valid)
-            explicit = _aux_value_and_grad(
-                router, logits, padding_mask=~valid, sequence_ids=ids, num_sequences=batch
-            )
-        assert torch.equal(implicit[0], explicit[0])
-        assert torch.equal(implicit[1], explicit[1])
+            for dtype in (torch.int64, torch.int32):
+                explicit = _aux_value_and_grad(
+                    router,
+                    logits,
+                    padding_mask=~valid,
+                    sequence_ids=ids.to(dtype),
+                    num_sequences=batch,
+                )
+                assert torch.equal(implicit[0], explicit[0]), dtype
+                assert torch.equal(implicit[1], explicit[1]), dtype
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("tp_size,cp_size", [(1, 1), (2, 2)])
@@ -384,6 +389,12 @@ class TestPerSequenceSeqAuxLoss:
             router.routing(logits, num_sequences=3)
         with pytest.raises(ValueError, match="sequence_ids"):
             router.routing(logits, sequence_ids=ids[:5], num_sequences=1)
+        # Batch-first ids, laid out like the padding mask of MoELayer.forward, have the right
+        # number of elements but not the flattened [seq_length, bsz] order.
+        with pytest.raises(ValueError, match=r"flattened token order.*shape \(2, 8\)"):
+            router.routing(logits, sequence_ids=ids.view(2, 8), num_sequences=1)
+        with pytest.raises(ValueError, match="dtype torch.float32"):
+            router.routing(logits, sequence_ids=ids.float(), num_sequences=1)
         with pytest.raises(ValueError, match="moe_seq_aux_loss_normalization"):
             _make_router(normalization="per_token")
 

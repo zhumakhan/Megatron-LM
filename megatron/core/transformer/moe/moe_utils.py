@@ -186,8 +186,8 @@ def per_sequence_load_balancing_loss_func(
         top_indices (torch.Tensor): Indices of the experts selected for each token without the
             expert bias. Shape [num_tokens, topk].
         sequence_ids (torch.Tensor): Index of the sequence of each token, in
-            [0, num_sequences). Shape [num_tokens]. Must refer to the same sequences on all
-            ranks of `reduce_group`.
+            [0, num_sequences). A 1-D int64 (or int32) tensor of shape [num_tokens], in the token
+            order of `probs`. Must refer to the same sequences on all ranks of `reduce_group`.
         num_sequences (int): Number of sequences B the loss is averaged over.
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
@@ -208,9 +208,17 @@ def per_sequence_load_balancing_loss_func(
         raise ValueError(
             f"Expected top_indices of shape {(num_tokens, topk)}, got {tuple(top_indices.shape)}."
         )
+    # A [batch, seq] tensor (the layout of the batch-first padding mask of MoELayer.forward) would
+    # have the right number of elements but the wrong order, so only a flat tensor is accepted.
+    if sequence_ids.dim() != 1 or sequence_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "sequence_ids must be a 1-D int64 (or int32) tensor in the flattened token order "
+            "([seq_length * bsz] for a [seq_length, bsz] router input), got shape "
+            f"{tuple(sequence_ids.shape)} and dtype {sequence_ids.dtype}."
+        )
     if sequence_ids.numel() != num_tokens:
         raise ValueError(f"Expected {num_tokens} sequence_ids, got {sequence_ids.numel()}.")
-    sequence_ids = sequence_ids.reshape(-1).long()
+    sequence_ids = sequence_ids.long()
     num_rows = num_sequences
     if padding_mask is not None:
         # Padding tokens accumulate into one extra row, which is dropped.

@@ -726,9 +726,10 @@ class MoELayer(BaseMoELayer):
                 the leading shape of `hidden_states` with the same sequence-parallel sharding. The
                 shared experts, the dispatch and the experts still use `hidden_states`.
                 Defaults to None, meaning `hidden_states`.
-            sequence_ids (torch.Tensor, optional): Global sequence index of every token, int64
-                of shape [seq_length * bsz] in the flattened [seq_length, bsz] order and identical
-                on the TP x CP ranks. Used by the per-sequence seq_aux_loss
+            sequence_ids (torch.Tensor, optional): Global sequence index of every token, a 1-D
+                int64 tensor of shape [seq_length * bsz] in the flattened [seq_length, bsz] order
+                (not the batch-first order of `padding_mask`). A sequence must have the same index
+                on all TP x CP ranks. Used by the per-sequence seq_aux_loss
                 (`moe_seq_aux_loss_normalization='per_sequence'`), e.g. for packed or compacted
                 inputs. Defaults to None, meaning the batch index.
             num_sequences (int, optional): Global number of sequences that `sequence_ids`
