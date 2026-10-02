@@ -7,9 +7,9 @@ tensor_parallel.checkpoint, which needs CUDA RNG state.
 """
 
 import types
-import unittest
 from unittest import mock
 
+import pytest
 import torch
 import torch.utils.checkpoint
 
@@ -90,33 +90,37 @@ def _run(block, input_ids=None):
     return len(calls)
 
 
-class TestFullRecomputeCheckpoints(unittest.TestCase):
+class TestFullRecomputeCheckpoints:
+    """Without FP8/FP4, the recompute path checkpoints through tensor_parallel.checkpoint."""
 
-    def test_block_method_checkpoints_first_layers_in_bf16(self):
+    def test_block_method_checkpoints_first_layers_without_fp8(self):
         block = _block(4, "block", 2)
-        self.assertEqual(_run(block), 2)
+        assert _run(block) == 2
         for layer in block.layers[:2]:
             # No-grad forward inside the checkpoint, then the recompute in backward.
-            self.assertEqual(layer.grad_modes, [False, True])
+            assert layer.grad_modes == [False, True]
         for layer in block.layers[2:]:
-            self.assertEqual(layer.grad_modes, [True])
+            assert layer.grad_modes == [True]
 
-    def test_uniform_method_checkpoints_every_chunk_in_bf16(self):
+    def test_uniform_method_checkpoints_every_chunk_without_fp8(self):
         block = _block(4, "uniform", 2)
-        self.assertEqual(_run(block), 2)
+        assert _run(block) == 2
         for layer in block.layers:
-            self.assertEqual(layer.grad_modes, [False, True])
+            assert layer.grad_modes == [False, True]
 
     def test_hash_routing_ids_reach_layers_through_checkpoint(self):
         block = _block(2, "block", 2, hash_layers=(0,))
         input_ids = torch.arange(SEQ * BATCH).reshape(BATCH, SEQ)
-        self.assertEqual(_run(block, input_ids=input_ids), 2)
-        self.assertTrue(all(ids is not None for ids in block.layers[0].input_ids_seen))
-        self.assertEqual(block.layers[1].input_ids_seen, [None, None])
+        assert _run(block, input_ids=input_ids) == 2
+        assert all(ids is not None for ids in block.layers[0].input_ids_seen)
+        assert block.layers[1].input_ids_seen == [None, None]
 
 
-@unittest.skipIf(recompute.te_mark_not_offload is None, "needs Transformer Engine's offload API")
-class TestRecomputeOffloadKeepsSharedInputsResident(unittest.TestCase):
+@pytest.mark.skipif(
+    recompute.te_mark_not_offload is None, reason="needs Transformer Engine's offload API"
+)
+class TestRecomputeOffloadKeepsSharedInputsResident:
+    """The CPU-offload path of full recompute keeps the inputs shared by all layers resident."""
 
     def test_hash_routing_ids_are_not_offloaded(self):
         block = _block(2, "block", 2, hash_layers=(0,), cpu_offloading=True)
@@ -133,10 +137,6 @@ class TestRecomputeOffloadKeepsSharedInputsResident(unittest.TestCase):
         block.group_prefetch_offload_commit_async = lambda tensor: tensor
         block.offload_manual_controller = None
 
-        self.assertEqual(_run(block, input_ids=input_ids), 2)
+        assert _run(block, input_ids=input_ids) == 2
         # Saved once per checkpointed layer, and marked resident every time.
-        self.assertEqual(saved_ids_marks, [True, True])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert saved_ids_marks == [True, True]
