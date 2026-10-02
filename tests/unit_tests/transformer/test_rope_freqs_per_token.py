@@ -2,6 +2,8 @@
 
 """rope_freqs_per_token: one rotary frequency row per packed (THD) token."""
 
+import inspect
+
 import pytest
 import torch
 
@@ -17,10 +19,6 @@ from tests.unit_tests.test_utilities import Utils
 
 pytest.importorskip("transformer_engine")
 
-from transformer_engine.pytorch.attention.rope import (  # noqa: E402
-    apply_rotary_pos_emb as te_apply_rotary_pos_emb,
-)
-
 from megatron.core.extensions.transformer_engine import (  # noqa: E402
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -30,6 +28,18 @@ from megatron.core.extensions.transformer_engine import (  # noqa: E402
 from tests.unit_tests.transformer.dit_attention_parity_utils import (  # noqa: E402
     DiTMaskedAttention,
     DiTSelfAttention,
+)
+
+try:
+    from transformer_engine.pytorch.attention.rope import (
+        apply_rotary_pos_emb as te_apply_rotary_pos_emb,
+    )
+except ImportError:  # Transformer Engine < 2.3 keeps the function elsewhere.
+    te_apply_rotary_pos_emb = None
+
+# Not every Transformer Engine version takes per-sequence start positions for THD RoPE.
+TE_ROPE_HAS_START_POSITIONS = te_apply_rotary_pos_emb is not None and (
+    "start_positions" in inspect.signature(te_apply_rotary_pos_emb).parameters
 )
 
 HEADS, HEAD_DIM = 4, 64
@@ -132,6 +142,10 @@ class TestRopeFreqsPerToken:
         for name, a, e in zip(("output", "grad"), actual, expected):
             _assert_bitwise(a, e, f"{layout} fused={fused} {dtype} {name}")
 
+    @pytest.mark.skipif(
+        not TE_ROPE_HAS_START_POSITIONS,
+        reason="Transformer Engine's apply_rotary_pos_emb takes no start_positions",
+    )
     @pytest.mark.parametrize("layout", sorted(LAYOUTS))
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     def test_fused_equals_te_thd_with_start_positions(self, layout, dtype):

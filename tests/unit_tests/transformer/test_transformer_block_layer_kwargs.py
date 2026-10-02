@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils._pytree import register_dataclass
 
+from megatron.core import recompute
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -517,7 +518,10 @@ class TestTransformerBlockLayerKwargs:
         # Every layer reads the context, so only the summation order of its gradient differs.
         _assert_equal_up_to_summation_order(context_grad, ref_context_grad, autocast=False)
 
-    @pytest.mark.skipif(not HAVE_TE, reason="CPU offloading needs Transformer Engine")
+    @pytest.mark.skipif(
+        not HAVE_TE or recompute.te_mark_not_offload is None,
+        reason="CPU offloading on the recompute path needs Transformer Engine's offload API",
+    )
     @pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "autocast-bf16"])
     def test_cpu_offloading_with_layer_kwargs(self, autocast):
         offload_kwargs = dict(
@@ -527,16 +531,22 @@ class TestTransformerBlockLayerKwargs:
         block = _build_block(recompute_method="block", **offload_kwargs)
         controller = block.offload_manual_controller
         assert controller is not None
-        with mock.patch.object(
-            controller, "start_offload_layer", wraps=controller.start_offload_layer
-        ) as start_offload:
+        with (
+            mock.patch.object(
+                controller, "start_offload_layer", wraps=controller.start_offload_layer
+            ) as start_offload,
+            mock.patch.object(
+                recompute, "te_mark_not_offload", wraps=recompute.te_mark_not_offload
+            ) as mark_not_offload,
+        ):
             result = _run(block, autocast=autocast)
         assert [c.args[0] for c in start_offload.call_args_list] == [0, 1, 2]
         # Offloading only moves bytes, so the results are bitwise identical.
         _assert_bitwise_equal(result["output"], reference["output"])
         _assert_same_grads(result, reference)
-        # The time embedding is shared by every layer: it stays on the GPU.
-        assert getattr(result["time_embedding"], "_TE_do_not_offload", False)
+        # The time embedding is shared by every layer: it is marked to stay on the GPU.
+        marked = [tensor for call in mark_not_offload.call_args_list for tensor in call.args]
+        assert any(tensor is result["time_embedding"] for tensor in marked)
 
     @pytest.mark.skipif(not HAVE_TE, reason="CPU offloading needs Transformer Engine")
     @pytest.mark.parametrize("recompute_method", [None, "block"])

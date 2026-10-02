@@ -145,18 +145,24 @@ class TestRecomputeOffloadKeepsSharedInputsResident:
     def test_hash_routing_ids_are_not_offloaded(self):
         block = _block(2, "block", 2, hash_layers=(0,), cpu_offloading=True)
         input_ids = torch.arange(SEQ * BATCH).reshape(BATCH, SEQ)
-        saved_ids_marks = []
+        marked_when_saved = []
 
-        def pack(tensor):
-            # What TE's offload hook checks before copying a saved tensor to the CPU.
-            if tensor is input_ids:
-                saved_ids_marks.append(getattr(tensor, "_TE_do_not_offload", False))
-            return tensor
+        with mock.patch.object(
+            recompute, "te_mark_not_offload", wraps=recompute.te_mark_not_offload
+        ) as mark_not_offload:
 
-        block.offload_context = torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t)
-        block.group_prefetch_offload_commit_async = lambda tensor: tensor
-        block.offload_manual_controller = None
+            def pack(tensor):
+                # The offload context sees every tensor that a checkpoint saves; Transformer
+                # Engine's offload hook keeps the tensors marked by mark_not_offload on the GPU.
+                if tensor is input_ids:
+                    marked = [t for call in mark_not_offload.call_args_list for t in call.args]
+                    marked_when_saved.append(any(t is input_ids for t in marked))
+                return tensor
 
-        assert _run(block, input_ids=input_ids) == 2
-        # Saved once per checkpointed layer, and marked resident every time.
-        assert saved_ids_marks == [True, True]
+            block.offload_context = torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t)
+            block.group_prefetch_offload_commit_async = lambda tensor: tensor
+            block.offload_manual_controller = None
+
+            assert _run(block, input_ids=input_ids) == 2
+        # Saved once per checkpointed layer, and marked resident before every save.
+        assert marked_when_saved == [True, True]
