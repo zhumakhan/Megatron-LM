@@ -245,8 +245,6 @@ class DotProductAttention(MegatronModule):
         # This is a noop for normal attention where ng == np. When using group query attention this
         # creates a view that has the keys and values virtually repeated along their dimension to
         # match the number of queries.
-
-        # attn_mask_type is not used.
         if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
             key = key.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
@@ -294,6 +292,8 @@ class DotProductAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
+        # The fused softmax applies self.attn_mask_type; the attn_mask_type argument only selects
+        # the key_padding handling above.
         attention_probs: Tensor = self.scale_mask_softmax(
             attention_scores, attention_mask, self.softmax_offset
         )
