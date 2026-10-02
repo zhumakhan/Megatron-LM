@@ -32,7 +32,7 @@ from tests.unit_tests.transformer.dit_attention_parity_utils import (  # noqa: E
 HEADS, HEAD_DIM, BATCH = 8, 64, 4
 REGISTERS, CAPTION_SLOTS, VIDEO_TOKENS = 4, 28, 64
 SEQUENCE = REGISTERS + CAPTION_SLOTS + VIDEO_TOKENS
-MASK_TYPES = ["key_padding", "padding", "no_mask", "arbitrary", "causal"]
+MASK_TYPES = ["key_padding", "padding", "no_mask", "arbitrary"]
 
 
 def _config(tp=1, cp=1, **kwargs):
@@ -319,6 +319,39 @@ class TestUlyssesAttention:
             _config(1, 16, num_layers=2, cp_comm_type=["p2p", "ulysses"])
         _config(1, 4, cp_comm_type="ulysses")
         _config(1, 16, num_attention_heads=8, num_layers=2, cp_comm_type=["p2p", "a2a"])
+
+    @pytest.mark.parametrize("mask_type", ["causal", "padding_causal", "causal_bottom_right"])
+    def test_rejects_causal_masks(self, mask_type, monkeypatch):
+        """Ulysses needs contiguous shards, but Megatron shards causal CP inputs zig-zag."""
+        self._initialize(1, 2, monkeypatch)
+        attn_mask_type = AttnMaskType[mask_type]
+        config = _config(1, 2, cp_comm_type="ulysses")
+
+        def local_attention(mask_type):
+            return DotProductAttention(
+                config,
+                layer_number=1,
+                attn_mask_type=mask_type,
+                attention_type="self",
+                cp_comm_type="ulysses",
+                pg_collection=_pg_collection(),
+            )
+
+        with pytest.raises(ValueError, match="causal"):
+            _te_attention(config, attn_mask_type, "ulysses")
+        with pytest.raises(ValueError, match="causal"):
+            local_attention(attn_mask_type)
+        # Per-call causal masks on modules built for a non-causal mask type.
+        inputs, _ = _global_inputs(HEADS)
+        shards = [_shard(t) for t in inputs]
+        for attention in (
+            _te_attention(config, AttnMaskType.no_mask, "ulysses"),
+            local_attention(AttnMaskType.no_mask),
+        ):
+            with pytest.raises(ValueError, match="causal"):
+                attention(*shards, None, attn_mask_type=attn_mask_type)
+        # Without context parallelism, cp_comm_type='ulysses' leaves causal attention alone.
+        _te_attention(_config(1, 1, cp_comm_type="ulysses"), attn_mask_type, "ulysses")
 
     def test_key_padding_rejects_te_context_parallelism(self, monkeypatch):
         """key_padding uses cp_comm_type='ulysses' for CP; TE's own CP cannot take the mask."""

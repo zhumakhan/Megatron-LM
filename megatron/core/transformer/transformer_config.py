@@ -1174,13 +1174,15 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     "ulysses": Megatron-side Ulysses for TEDotProductAttention and DotProductAttention. An
     all-to-all gathers the full sequence of q/k/v with 1 / cp of the heads, the attention kernel
-    runs without context parallelism (so every mask type of that kernel works, including
-    padding, arbitrary and key_padding masks with holes), and an all-to-all returns the output
-    to the sequence shards. Contract: the sequence is sharded contiguously across the CP group
-    (rank r holds positions [r * s / cp, (r + 1) * s / cp)) rather than in TE's zig-zag order,
-    rotary frequencies must be sharded the same way, and the attention mask passed to the layer
-    is CP-global (covers the full sequence). Requires num_attention_heads and num_query_groups
-    to be divisible by tensor_model_parallel_size * context_parallel_size; sbhd inputs only (no
+    runs without context parallelism (so the non-causal mask types of that kernel work,
+    including padding, arbitrary and key_padding masks with holes), and an all-to-all returns
+    the output to the sequence shards. Contract: the sequence is sharded contiguously across the
+    CP group (rank r holds positions [r * s / cp, (r + 1) * s / cp)) rather than in TE's zig-zag
+    order, rotary frequencies must be sharded the same way, and the attention mask passed to
+    the layer is CP-global (covers the full sequence). Megatron's built-in context-parallel data
+    and RoPE sharding (e.g. GPT training) is zig-zag, so causal mask types are rejected; use
+    "p2p", "all_gather" or "a2a" for them. Requires num_attention_heads and num_query_groups to
+    be divisible by tensor_model_parallel_size * context_parallel_size; sbhd inputs only (no
     packed sequences); no attention bias, learnable softmax offsets or qk-clip logit tracking.
     """
 

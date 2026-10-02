@@ -17,7 +17,7 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.utils import (
     get_pg_rank,
     get_tensor_model_parallel_group_if_none,
@@ -332,6 +332,30 @@ def ulysses_inner_config(
     inner.num_query_groups //= cp_size
     inner.context_parallel_size = 1
     return inner
+
+
+def check_ulysses_attn_mask_type(attn_mask_type: AttnMaskType) -> None:
+    """Reject the mask types that ``cp_comm_type='ulysses'`` does not support.
+
+    Ulysses needs the sequence sharded contiguously across the context-parallel group.
+    Megatron's own context-parallel data and RoPE sharding is load-balanced (zig-zag) for
+    causal attention, and a causal mask over a gathered zig-zag sequence silently gives wrong
+    attention, so causal mask types are rejected.
+
+    Args:
+        attn_mask_type (AttnMaskType): mask type of the attention call.
+    """
+    if attn_mask_type in (
+        AttnMaskType.causal,
+        AttnMaskType.padding_causal,
+        AttnMaskType.causal_bottom_right,
+    ):
+        raise ValueError(
+            f"cp_comm_type='ulysses' does not support {attn_mask_type}: it needs contiguous "
+            "context-parallel sequence shards, while Megatron's context-parallel data and RoPE "
+            "sharding for causal attention is load-balanced (zig-zag). Use cp_comm_type 'p2p', "
+            "'all_gather' or 'a2a' for causal attention."
+        )
 
 
 def ulysses_attention(

@@ -19,6 +19,7 @@ from megatron.core.transformer.utils import (
     attention_mask_func,
     check_key_padding_mask,
     check_key_padding_window,
+    check_ulysses_attn_mask_type,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
     ulysses_attention,
@@ -46,7 +47,7 @@ class DotProductAttention(MegatronModule):
     broadcast over the queries like an arbitrary mask, and the output rows of samples without a
     valid key are zeroed; layers with sliding window attention do not support them. Context
     parallelism is supported with cp_comm_type='ulysses' only (see
-    TransformerConfig.cp_comm_type).
+    TransformerConfig.cp_comm_type), which rejects causal mask types.
     """
 
     def __init__(
@@ -65,6 +66,7 @@ class DotProductAttention(MegatronModule):
         # Megatron-side Ulysses: attend over the full sequence with 1 / cp of the heads.
         self.ulysses_cp_group = None
         if config.context_parallel_size > 1 and cp_comm_type == "ulysses":
+            check_ulysses_attn_mask_type(attn_mask_type)
             self.ulysses_cp_group = (
                 pg_collection.cp
                 if getattr(pg_collection, "cp", None) is not None
@@ -182,6 +184,9 @@ class DotProductAttention(MegatronModule):
     ):
         """Forward."""
         if self.ulysses_cp_group is not None:
+            check_ulysses_attn_mask_type(
+                self.attn_mask_type if attn_mask_type is None else attn_mask_type
+            )
             return ulysses_attention(
                 self._forward_local,
                 query,

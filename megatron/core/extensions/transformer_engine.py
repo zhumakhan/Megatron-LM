@@ -56,6 +56,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     check_key_padding_mask,
     check_key_padding_window,
+    check_ulysses_attn_mask_type,
     ensure_metadata_has_dp_cp_group,
     get_key_padding_metadata,
     is_layer_window_attention,
@@ -2179,7 +2180,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
     cp_comm_type='ulysses': see TransformerConfig.cp_comm_type. The TE kernel is built without
     context parallelism for ``1 / cp`` of the heads, and forward exchanges q/k/v and the output
-    with all-to-alls over the context-parallel group.
+    with all-to-alls over the context-parallel group. Causal mask types are rejected.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2208,6 +2209,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # 1 / cp of the heads; forward() performs the all-to-alls.
         self.ulysses_cp_group = None
         if config.context_parallel_size > 1 and cp_comm_type == "ulysses":
+            check_ulysses_attn_mask_type(attn_mask_type)
             self.ulysses_cp_group = (
                 getattr(pg_collection, "cp", None)
                 if pg_collection is not None
@@ -2423,6 +2425,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "are not supported."
             )
             assert attention_bias is None, "cp_comm_type='ulysses' does not support attention_bias"
+            check_ulysses_attn_mask_type(attn_mask_type)
             return ulysses_attention(
                 self._forward_local,
                 query,
