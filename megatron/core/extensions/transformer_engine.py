@@ -61,6 +61,8 @@ from megatron.core.transformer.utils import (
     key_padding_pack,
     key_padding_safe_mask,
     make_sharded_tensors_for_checkpoint,
+    ulysses_attention,
+    ulysses_inner_config,
 )
 from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
@@ -2170,6 +2172,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     samples without a valid key give zero output rows. Inputs that TE's fused and flash
     backends cannot run (e.g. fp32) use the dense mask on the unfused backend instead. With
     THD packed_seq_params, key_padding and arbitrary map to TE's ``padding``.
+
+    cp_comm_type='ulysses': see TransformerConfig.cp_comm_type. The TE kernel is built without
+    context parallelism for ``1 / cp`` of the heads, and forward exchanges q/k/v and the output
+    with all-to-alls over the context-parallel group.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2193,6 +2199,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
+
+        # Megatron-side Ulysses: the TE kernel runs without CP on the full sequence and on
+        # 1 / cp of the heads; forward() performs the all-to-alls.
+        self.ulysses_cp_group = None
+        if config.context_parallel_size > 1 and cp_comm_type == "ulysses":
+            self.ulysses_cp_group = (
+                getattr(pg_collection, "cp", None)
+                if pg_collection is not None
+                else get_context_parallel_group(check_initialized=False)
+            )
+            config = ulysses_inner_config(config, self.ulysses_cp_group)
 
         self.config = config
         self.te_forward_mask_type = False
@@ -2392,6 +2409,48 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        if self.ulysses_cp_group is not None:
+            assert packed_seq_params is None and self.qkv_format == "sbhd", (
+                "cp_comm_type='ulysses' supports sbhd inputs only; packed sequences (THD) "
+                "are not supported."
+            )
+            assert attention_bias is None, "cp_comm_type='ulysses' does not support attention_bias"
+            return ulysses_attention(
+                self._forward_local,
+                query,
+                key,
+                value,
+                self.ulysses_cp_group,
+                attention_mask,
+                attn_mask_type,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            )
+        return self._forward_local(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            num_splits=num_splits,
+            bf16_backward=bf16_backward,
+        )
+
+    def _forward_local(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Attention over the sequence held by this rank (no Megatron-side CP exchange)."""
         if attn_mask_type == AttnMaskType.key_padding and packed_seq_params is None:
             return self._forward_key_padding(
                 query,
@@ -2455,9 +2514,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         """
         assert self.te_forward_mask_type, "AttnMaskType.key_padding requires TE >= 0.12"
         assert attention_bias is None, "attention_bias is not supported with key_padding masks"
-        assert (
-            self.config.context_parallel_size == 1
-        ), "AttnMaskType.key_padding does not support context parallelism"
+        assert self.config.context_parallel_size == 1, (
+            "AttnMaskType.key_padding supports context parallelism only through "
+            "cp_comm_type='ulysses'"
+        )
         sbhd = self.qkv_format == "sbhd"
         assert sbhd or self.qkv_format == "bshd", f"key_padding: qkv_format {self.qkv_format}"
         te_kwargs = dict(num_splits=num_splits, bf16_backward=bf16_backward)

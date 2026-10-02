@@ -20,6 +20,8 @@ from megatron.core.transformer.utils import (
     check_key_padding_mask,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
+    ulysses_attention,
+    ulysses_inner_config,
 )
 from megatron.core.utils import divide
 
@@ -40,7 +42,9 @@ class DotProductAttention(MegatronModule):
      s: sequence length
 
     AttnMaskType.key_padding masks (``[b, 1, 1, sk]``) are broadcast over the queries like an
-    arbitrary mask, and the output rows of samples without a valid key are zeroed.
+    arbitrary mask, and the output rows of samples without a valid key are zeroed. Context
+    parallelism is supported with cp_comm_type='ulysses' only (see
+    TransformerConfig.cp_comm_type).
     """
 
     def __init__(
@@ -56,11 +60,22 @@ class DotProductAttention(MegatronModule):
     ):
         super().__init__(config=config)
 
+        # Megatron-side Ulysses: attend over the full sequence with 1 / cp of the heads.
+        self.ulysses_cp_group = None
+        if config.context_parallel_size > 1 and cp_comm_type == "ulysses":
+            self.ulysses_cp_group = (
+                pg_collection.cp
+                if getattr(pg_collection, "cp", None) is not None
+                else parallel_state.get_context_parallel_group()
+            )
+            config = ulysses_inner_config(config, self.ulysses_cp_group)
+
         self.config: TransformerConfig = config
 
-        assert (
-            self.config.context_parallel_size == 1
-        ), "Context parallelism is only supported by TEDotProductAttention!"
+        assert self.config.context_parallel_size == 1, (
+            "Context parallelism is only supported by TEDotProductAttention, or with "
+            "cp_comm_type='ulysses'!"
+        )
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -162,6 +177,39 @@ class DotProductAttention(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Forward."""
+        if self.ulysses_cp_group is not None:
+            return ulysses_attention(
+                self._forward_local,
+                query,
+                key,
+                value,
+                self.ulysses_cp_group,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+        return self._forward_local(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def _forward_local(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: Optional[AttnMaskType] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Attention over the sequence held by this rank."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
