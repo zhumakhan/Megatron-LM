@@ -30,6 +30,7 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -202,6 +203,37 @@ def test_fused_layer_norm_replays(hidden, zero_centered_gamma):
     assert_module_replays_bit_exact(
         module, (x,), replays=3, contention=True, what=f"FusedLayerNorm[{hidden}]"
     )
+
+
+# --- local DotProductAttention ----------------------------------------------------------
+
+
+def test_local_dot_product_attention_key_padding_replays():
+    """Local attention with an AttnMaskType.key_padding mask (holes, a sample without keys)."""
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        module = DotProductAttention(
+            _config(hidden_size=2048, num_attention_heads=16, attention_dropout=0.0),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.key_padding,
+            attention_type="self",
+        )
+        s, b, h, d = 1024, 3, 16, 128
+        q, k, v = (
+            torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(3)
+        )
+        mask = torch.zeros(b, 1, 1, s, dtype=torch.bool, device="cuda")
+        mask[0, ..., 100:700] = True
+        mask[2] = True
+
+        def fn(q, k, v):
+            return module(q, k, v, mask, attn_mask_type=AttnMaskType.key_padding)
+
+        assert_replays_bit_exact(fn, (q, k, v), replays=3, what="DotProductAttention[key_padding]")
+    finally:
+        Utils.destroy_model_parallel()
 
 
 # --- apex fused scale-mask softmax -------------------------------------------------------

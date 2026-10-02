@@ -274,6 +274,13 @@ class TransformerConfig(ModelParallelConfig):
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
 
+    rope_freqs_per_token: bool = False
+    """If True, the rotary frequencies passed with THD packed sequences hold one row per packed
+    token (``[t, 1, 1, d]``, row i rotates token i, e.g. precomputed multi-axis coordinates), so
+    positions do not restart at each sequence start. The THD tensor is then rotated as a
+    ``[t, 1, h, d]`` sbhd view (fused or unfused). If False, THD frequencies are indexed by the
+    position within each sequence. Requires context_parallel_size == 1."""
+
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
@@ -307,6 +314,12 @@ class TransformerConfig(ModelParallelConfig):
 
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
+
+    attention_output_gate_in_fp32: bool = True
+    """If True, the attention output gate computes ``x * sigmoid(gate)`` in fp32 with a fused
+    kernel and casts the result back to the input dtype. If False, it is computed eagerly in
+    the input dtype (``sigmoid(gate)`` is rounded to that dtype first, as in reference
+    implementations that gate in bf16). Only used when attention_output_gate is True."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -1149,7 +1162,7 @@ class TransformerConfig(ModelParallelConfig):
     """Inter-gpu communication type for context parallelism.
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
-    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
+    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p" or "ulysses".
     "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
     overlapped with attention compute.
     "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
@@ -1159,6 +1172,18 @@ class TransformerConfig(ModelParallelConfig):
     "a2a+p2p": A hierarchical implementation of context parallelism to attention.
     It uses A2A communications in low-level CP groups (e.g., via NVLink),
     and P2P communications in high-level CP groups (e.g., via IBLink).
+    "ulysses": Megatron-side Ulysses for TEDotProductAttention and DotProductAttention. An
+    all-to-all gathers the full sequence of q/k/v with 1 / cp of the heads, the attention kernel
+    runs without context parallelism (so the non-causal mask types of that kernel work,
+    including padding, arbitrary and key_padding masks with holes), and an all-to-all returns
+    the output to the sequence shards. Contract: the sequence is sharded contiguously across the
+    CP group (rank r holds positions [r * s / cp, (r + 1) * s / cp)) rather than in TE's zig-zag
+    order, rotary frequencies must be sharded the same way, and the attention mask passed to
+    the layer is CP-global (covers the full sequence). Megatron's built-in context-parallel data
+    and RoPE sharding (e.g. GPT training) is zig-zag, so causal mask types are rejected; use
+    "p2p", "all_gather" or "a2a" for them. Requires num_attention_heads and num_query_groups to
+    be divisible by tensor_model_parallel_size * context_parallel_size; sbhd inputs only (no
+    packed sequences); no attention bias, learnable softmax offsets or qk-clip logit tracking.
     """
 
     linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
@@ -3821,6 +3846,30 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+            cp_comm_types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            if "ulysses" in cp_comm_types:
+                shards = self.tensor_model_parallel_size * self.context_parallel_size
+                for name in ("num_attention_heads", "num_query_groups"):
+                    if getattr(self, name) % shards != 0:
+                        raise ValueError(
+                            f"cp_comm_type='ulysses' needs {name} ({getattr(self, name)}) to be "
+                            "divisible by tensor_model_parallel_size * context_parallel_size "
+                            f"({shards})."
+                        )
+                if self.softmax_type == "learnable":
+                    raise ValueError(
+                        "cp_comm_type='ulysses' does not support softmax_type='learnable'."
+                    )
+                if self.qk_clip or self.log_max_attention_logit:
+                    raise ValueError(
+                        "cp_comm_type='ulysses' does not support qk_clip or "
+                        "log_max_attention_logit."
+                    )
+
+        if self.rope_freqs_per_token and self.context_parallel_size > 1:
+            raise ValueError("rope_freqs_per_token requires context_parallel_size == 1.")
 
         assert (
             self.pipeline_model_parallel_size > 0

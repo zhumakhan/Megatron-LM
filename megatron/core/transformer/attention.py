@@ -1695,7 +1695,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            if self.config.attention_output_gate_in_fp32:
+                core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            else:
+                core_attn_out = self._apply_output_gate_in_input_dtype(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         return core_attn_out
@@ -1724,6 +1727,13 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         x = x * torch.sigmoid(gate.float())
         x = x.to(x_dtype)
         return x
+
+    def _apply_output_gate_in_input_dtype(self, x, gate):
+        """Output gate computed eagerly in the dtype of ``x`` (attention_output_gate_in_fp32=False).
+
+        Unlike the fused fp32 gate, sigmoid(gate) is rounded to the input dtype before scaling.
+        """
+        return x * torch.sigmoid(gate.reshape_as(x))
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""

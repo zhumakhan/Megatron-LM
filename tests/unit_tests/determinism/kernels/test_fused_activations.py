@@ -145,6 +145,19 @@ def test_attention_output_gate_replays_bit_exactly():
     )
 
 
+def test_attention_output_gate_in_input_dtype_replays_bit_exactly():
+    """``attention_output_gate_in_fp32=False``: the eager bf16 gate; ``self`` is unused."""
+    seeded()
+    x = _act((2048, 4, 4096))
+    gate = _act((2048, 4, 4096))
+    assert_replays_bit_exact(
+        lambda x, gate: Attention._apply_output_gate_in_input_dtype(None, x, gate),
+        (x, gate),
+        replays=3,
+        what="attention output gate (input dtype)",
+    )
+
+
 def test_l2norm_replays_bit_exactly():
     """QK L2 norm: compiled row reduction (``pow(2).mean(-1)``) over head_dim."""
     seeded()
