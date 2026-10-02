@@ -564,6 +564,57 @@ def _fork_rng():
         _set_all_rng_states(*current_states)
 
 
+# Devices whose torch autocast state an activation checkpoint records and replays.
+_AUTOCAST_DEVICE_TYPES = ("cuda", "cpu")
+
+# One (device_type, enabled, dtype, cache_enabled) entry per device in _AUTOCAST_DEVICE_TYPES.
+_AutocastState = tuple[tuple[str, bool, torch.dtype, bool], ...]
+
+
+def _get_autocast_state() -> _AutocastState:
+    """Return the torch autocast state of the CUDA and CPU devices.
+
+    Each entry holds the arguments of the ``torch.autocast`` context that re-enters the state
+    of one device: ``(device_type, enabled, dtype, cache_enabled)``.
+    """
+    cache_enabled = torch.is_autocast_cache_enabled()
+    return tuple(
+        (
+            device_type,
+            torch.is_autocast_enabled(device_type),
+            torch.get_autocast_dtype(device_type),
+            cache_enabled,
+        )
+        for device_type in _AUTOCAST_DEVICE_TYPES
+    )
+
+
+@contextlib.contextmanager
+def _replay_autocast_state(state: _AutocastState):
+    """Re-enter a torch autocast state recorded by ``_get_autocast_state``.
+
+    An activation checkpoint recomputes its function in the backward pass, which usually runs
+    outside the forward pass's ``torch.autocast`` regions. Without the recorded state the
+    recompute would, for example, run ``linear`` in the input dtype instead of the autocast
+    dtype and ``rms_norm`` in the input dtype instead of fp32, so the recomputed activations,
+    and the gradients computed from them, would differ from the forward pass. This matches
+    ``torch.utils.checkpoint`` and Transformer Engine's ``checkpoint``.
+
+    Devices whose current state already matches the recorded one are left untouched, so this
+    is a no-op when autocast is off in both passes.
+    """
+    with contextlib.ExitStack() as stack:
+        for recorded, current in zip(state, _get_autocast_state()):
+            if recorded != current:
+                device_type, enabled, dtype, cache_enabled = recorded
+                stack.enter_context(
+                    torch.autocast(
+                        device_type, dtype=dtype, enabled=enabled, cache_enabled=cache_enabled
+                    )
+                )
+        yield
+
+
 # Global flag that's toggled whenever inside a checkpointing context
 IS_CHECKPOINTING = False
 
@@ -595,6 +646,9 @@ class CheckpointFunction(torch.autograd.Function):
     This function is adapted from torch.utils.checkpoint with two main changes:
     1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`
     2) the states in the model parallel tracker are also properly tracked/set/reset.
+
+    Like torch.utils.checkpoint, it records the torch autocast state of the forward pass and
+    replays it for the recompute in the backward pass.
     """
 
     # pylint: disable=missing-function-docstring
@@ -613,6 +667,8 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
+        # Copy the autocast state, so that the recompute runs under the same autocast.
+        ctx.autocast_state = _get_autocast_state()
 
         with torch.no_grad():
             outputs = run_function(*args)
@@ -656,7 +712,11 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad(), suspend_tensor_observations():
+            with (
+                torch.enable_grad(),
+                _replay_autocast_state(ctx.autocast_state),
+                suspend_tensor_observations(),
+            ):
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -858,6 +918,8 @@ class CheckpointWithoutOutput(object):
 
     Due to the reason above, to save memory with this method, the caller should make sure that the
     discarded output tensors are directly saved in the following modules for backward computation.
+
+    The recomputation runs under the torch autocast state that was active in ``checkpoint()``.
     """
 
     def __init__(self, fp8=False, ckpt_manager=None, retain_input_tensors=False):
@@ -888,6 +950,7 @@ class CheckpointWithoutOutput(object):
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
         self.fwd_cuda_rng_state_tracker = None
+        self.autocast_state = None
         self.ctx = None
         self.outputs = None
 
@@ -909,6 +972,7 @@ class CheckpointWithoutOutput(object):
         self.run_function = run_function
 
         self.rng_states = _get_all_rng_states()
+        self.autocast_state = _get_autocast_state()
 
         if self.retain_input_tensors:
             self._saved_input_ptrs = {
@@ -956,11 +1020,18 @@ class CheckpointWithoutOutput(object):
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
+            with (
+                torch.enable_grad(),
+                _replay_autocast_state(self.autocast_state),
+                fp8_ctx,
+                recompute_ctx,
+                suspend_tensor_observations(),
+            ):
                 outputs = self.run_function(*inputs)
 
         self.run_function = None
         self.rng_states = None
+        self.autocast_state = None
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
