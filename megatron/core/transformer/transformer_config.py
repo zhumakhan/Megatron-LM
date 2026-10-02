@@ -308,6 +308,12 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    attention_output_gate_in_fp32: bool = True
+    """If True, the attention output gate computes ``x * sigmoid(gate)`` in fp32 with a fused
+    kernel and casts the result back to the input dtype. If False, it is computed eagerly in
+    the input dtype (``sigmoid(gate)`` is rounded to that dtype first, as in reference
+    implementations that gate in bf16). Only used when attention_output_gate is True."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
