@@ -618,17 +618,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             layer_kwargs (Dict[str, Any], optional): Extra keyword arguments passed to every
                 layer call of this block, e.g. conditioning tensors shared by all layers. The
                 caller must make sure the layers accept them; the stock TransformerLayer does
-                not, so this is meant for custom layer classes. The keys must not repeat the
-                keyword arguments the block passes itself (hidden_states, attention_mask,
-                context, ...). Under full activation recompute the mapping is flattened with
-                ``torch.utils._pytree``: its tensor leaves become explicit inputs of every
-                activation checkpoint, so they are saved and restored like the hidden states,
-                receive gradients, and stay on the GPU when the recompute path offloads
-                activations to the CPU; the other leaves are passed through as constants.
-                Tensors inside objects that pytree does not flatten (for example unregistered
-                dataclasses) are constants as well and get no gradients through a recomputed
-                layer. A recomputed layer runs again in the backward pass, so mutable values
-                in layer_kwargs (e.g. lists that collect per-layer outputs) see both calls.
+                not, so this is meant for custom layer classes. These should subclass
+                BaseTransformerLayer: under full activation recompute, a layer that does not is
+                called like a MambaLayer and gets no context, context_mask, attention_bias or
+                padding_mask. The keys must not repeat the keyword arguments the block passes
+                itself (hidden_states, attention_mask, context, ...). Under full activation
+                recompute the mapping is flattened with ``torch.utils._pytree``, every value
+                that holds no tensor counting as a leaf. Its tensor leaves become explicit
+                inputs of every activation checkpoint, so they are saved and restored like the
+                hidden states, receive gradients, and stay on the GPU when the recompute path
+                offloads activations to the CPU. The dicts, lists and tuples around them are
+                rebuilt for every chunk of layers the block runs, so in-place changes to those
+                do not reach the caller. All other values (numbers, objects that pytree does
+                not flatten, containers without tensors such as an empty list that collects
+                per-layer statistics) are passed by identity; a checkpointed layer runs twice,
+                without gradients in the forward pass and again in the backward pass, so such
+                side channels see both calls. Tensors that pytree cannot reach, e.g. inside an
+                unregistered dataclass, are closed over, which suits tensors without gradients
+                such as masks. A closed-over tensor that requires grad would be backpropagated
+                into from inside each checkpoint that reads it, which breaks backward for a
+                non-leaf tensor read by several checkpoints. Pass such tensors directly or
+                inside dicts, lists or tuples, or register their container with
+                ``torch.utils._pytree.register_dataclass``; a dataclass holding such a tensor
+                raises a ValueError.
             exit_after_layer (int, optional): Global layer index (0-based across all pipeline
                 stages, like extract_layer_indices) after which the block stops. Later layers
                 do not run and the final layernorm (and the mHC output contraction) is skipped,

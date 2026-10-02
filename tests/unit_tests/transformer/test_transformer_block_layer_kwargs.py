@@ -4,15 +4,18 @@
 ``layer_kwargs`` passes extra keyword arguments, e.g. conditioning tensors shared by all layers,
 to every layer call; ``exit_after_layer`` stops the block after one layer. Both have to give the
 same results in the eager layer loop and under full activation recompute, where the tensors of
-``layer_kwargs`` are explicit checkpoint inputs.
+``layer_kwargs`` are explicit checkpoint inputs and values without tensors reach the layers as the
+caller's objects.
 """
 
+import dataclasses
 from contextlib import nullcontext
 from unittest import mock
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils._pytree import register_dataclass
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -79,6 +82,84 @@ class _PlainConditionedLayer(MegatronModule, BaseTransformerLayer):
         return hidden_states + gate * update * conditioning["mlp_scale"], None
 
 
+@dataclasses.dataclass
+class _DataclassConditioning:
+    """Conditioning tensors in a dataclass that ``torch.utils._pytree`` does not flatten."""
+
+    time: torch.Tensor
+    token_mask: torch.Tensor
+
+
+@dataclasses.dataclass
+class _RegisteredDataclassConditioning(_DataclassConditioning):
+    """The same conditioning in a dataclass registered with ``torch.utils._pytree``."""
+
+
+register_dataclass(_RegisteredDataclassConditioning)
+
+
+class _DataclassConditionedLayer(MegatronModule, BaseTransformerLayer):
+    """A layer conditioned like _PlainConditionedLayer, through a dataclass."""
+
+    def __init__(self, config, layer_number=1, **kwargs):
+        super().__init__(config=config)
+        self.layer_number = layer_number
+        self.linear = torch.nn.Linear(config.hidden_size, config.hidden_size)
+        self.modulation = torch.nn.Linear(CONDITIONING, config.hidden_size)
+
+    def forward(self, hidden_states, *, conditioning, **kwargs):
+        gate = self.modulation(F.silu(conditioning.time))
+        update = torch.tanh(self.linear(hidden_states)) * (~conditioning.token_mask)[..., None]
+        return hidden_states + gate * update, None
+
+
+class _SideChannelLayer(MegatronModule, BaseTransformerLayer):
+    """A layer that reports a statistic of its output through containers in layer_kwargs.
+
+    ``statistics`` is a list at the top level of layer_kwargs; ``conditioning`` is a dict that
+    holds a tensor (``scale``) next to the dict ``statistics_by_layer``.
+    """
+
+    def __init__(self, config, layer_number=1, **kwargs):
+        super().__init__(config=config)
+        self.layer_number = layer_number
+        self.linear = torch.nn.Linear(config.hidden_size, config.hidden_size)
+
+    def forward(self, hidden_states, *, statistics, conditioning, **kwargs):
+        output = hidden_states + conditioning["scale"] * torch.tanh(self.linear(hidden_states))
+        statistic = output.detach().float().pow(2).mean()
+        statistics.append(statistic)
+        conditioning["statistics_by_layer"].setdefault(self.layer_number, []).append(statistic)
+        return output, None
+
+
+class _BlockArgumentsLayer(MegatronModule, BaseTransformerLayer):
+    """A layer that is not a TransformerLayer and uses context, attention_bias and padding_mask.
+
+    ``received`` records which of them every call got.
+    """
+
+    def __init__(self, config, layer_number=1, **kwargs):
+        super().__init__(config=config)
+        self.layer_number = layer_number
+        self.linear = torch.nn.Linear(config.hidden_size, config.hidden_size)
+        self.received = []
+
+    def forward(
+        self, hidden_states, *, context=None, attention_bias=None, padding_mask=None, **kwargs
+    ):
+        arguments = dict(context=context, attention_bias=attention_bias, padding_mask=padding_mask)
+        self.received.append(tuple(name for name, value in arguments.items() if value is not None))
+        update = self.linear(hidden_states if context is None else hidden_states + context)
+        if attention_bias is not None:
+            update = update + attention_bias
+        update = torch.tanh(update)
+        if padding_mask is not None:
+            # [b, s], True marks the padding tokens, which keep their hidden states.
+            update = update * (~padding_mask).transpose(0, 1)[..., None]
+        return hidden_states + update, context
+
+
 def _layer_spec(layer_class):
     if layer_class is _ConditionedLayer:
         return ModuleSpec(
@@ -130,9 +211,15 @@ def _count_forward_calls(block):
     return calls, handles
 
 
-def _run(block, autocast=False, **forward_kwargs):
+def _conditioning_dict(time_embedding, token_mask):
+    """layer_kwargs for _ConditionedLayer and _PlainConditionedLayer."""
+    return {"conditioning": {"time": time_embedding, "masks": [token_mask], "mlp_scale": 0.5}}
+
+
+def _run(block, autocast=False, make_layer_kwargs=_conditioning_dict, **forward_kwargs):
     """One forward and backward pass of ``block`` with conditioning passed as layer_kwargs.
 
+    ``make_layer_kwargs`` builds layer_kwargs from the time embedding and the token mask.
     Returns the output, the gradients of the input, of the shared time embedding, of the time
     embedder weight and of every block parameter, and the forward calls of every layer.
     """
@@ -152,9 +239,7 @@ def _run(block, autocast=False, **forward_kwargs):
             # The time embedding is not a leaf: its gradient has to flow on to the embedder.
             time_embedding = F.silu(F.linear(timesteps, embedder_weight))
             time_embedding.retain_grad()
-            layer_kwargs = {
-                "conditioning": {"time": time_embedding, "masks": [token_mask], "mlp_scale": 0.5}
-            }
+            layer_kwargs = make_layer_kwargs(time_embedding, token_mask)
             output = block(
                 hidden_states=hidden_states,
                 attention_mask=None,
@@ -208,7 +293,9 @@ def _assert_same_grads(result, reference, layers_per_chunk=1, autocast=False):
         )
     # The time embedding is shared by all layers.
     for key in ("time_embedding_grad", "embedder_grad"):
-        if layers_per_chunk == 1:
+        if reference[key] is None:
+            assert result[key] is None, key
+        elif layers_per_chunk == 1:
             _assert_bitwise_equal(result[key], reference[key])
         else:
             _assert_equal_up_to_summation_order(result[key], reference[key], autocast)
@@ -293,6 +380,142 @@ class TestTransformerBlockLayerKwargs:
             block(hidden_states, None, exit_after_layer=1, extract_layer_indices={2})
         with pytest.raises(ValueError, match="must not contain"):
             block(hidden_states, None, layer_kwargs={"attention_mask": None})
+
+    @pytest.mark.parametrize(
+        "recompute_method, recompute_num_layers, calls",
+        [
+            (None, None, [1] * NUM_LAYERS),
+            ("block", NUM_LAYERS, [2] * NUM_LAYERS),
+            ("block", 2, [2, 2] + [1] * (NUM_LAYERS - 2)),
+            ("uniform", 2, [2] * NUM_LAYERS),
+        ],
+        ids=["eager", "block", "partial-block", "uniform"],
+    )
+    def test_side_channels(self, recompute_method, recompute_num_layers, calls):
+        # Values without tensors, e.g. empty containers that collect per-layer statistics, reach
+        # the layers as the caller's objects, also inside a dict that holds a tensor, which full
+        # recompute rebuilds around the checkpoint inputs.
+        def run(block):
+            generator = torch.Generator(device="cuda").manual_seed(7)
+            hidden_states = torch.randn(
+                (SEQ_LEN, MICRO_BATCH, HIDDEN), device="cuda", generator=generator
+            ).requires_grad_(True)
+            scale = torch.rand(
+                (MICRO_BATCH, HIDDEN), device="cuda", generator=generator
+            ).requires_grad_(True)
+            statistics, statistics_by_layer = [], {}
+            layer_kwargs = {
+                "statistics": statistics,
+                "conditioning": {"scale": scale, "statistics_by_layer": statistics_by_layer},
+            }
+            output = block(
+                hidden_states=hidden_states, attention_mask=None, layer_kwargs=layer_kwargs
+            )
+            forward_counts = [len(statistics_by_layer.get(n, [])) for n in range(1, NUM_LAYERS + 1)]
+            assert len(statistics) == NUM_LAYERS
+            assert forward_counts == [1] * NUM_LAYERS
+            output.float().pow(2).mean().backward()
+            return output, scale.grad, statistics, statistics_by_layer
+
+        reference_output, _, _, reference_statistics = run(_build_block(_SideChannelLayer))
+        config_kwargs = {}
+        if recompute_num_layers is not None:
+            config_kwargs["recompute_num_layers"] = recompute_num_layers
+        block = _build_block(_SideChannelLayer, recompute_method, **config_kwargs)
+        output, scale_grad, statistics, statistics_by_layer = run(block)
+
+        _assert_bitwise_equal(output, reference_output)
+        # The tensor inside the rebuilt dict gets gradients.
+        assert scale_grad is not None and scale_grad.abs().sum() > 0
+        # A checkpointed layer adds its statistic once more when it is recomputed.
+        counts = [len(statistics_by_layer[n]) for n in range(1, NUM_LAYERS + 1)]
+        assert counts == calls
+        assert len(statistics) == sum(calls)
+        for layer_number, layer_statistics in statistics_by_layer.items():
+            (expected,) = reference_statistics[layer_number]
+            for statistic in layer_statistics:
+                _assert_bitwise_equal(statistic, expected)
+
+    @pytest.mark.parametrize("recompute_method", ["block", "uniform"])
+    def test_dataclass_values(self, recompute_method):
+        def unregistered(time_embedding, token_mask):
+            return {"conditioning": _DataclassConditioning(time_embedding, token_mask)}
+
+        def unregistered_without_grad(time_embedding, token_mask):
+            return {"conditioning": _DataclassConditioning(time_embedding.detach(), token_mask)}
+
+        def registered(time_embedding, token_mask):
+            return {"conditioning": _RegisteredDataclassConditioning(time_embedding, token_mask)}
+
+        block = _build_block(_DataclassConditionedLayer, recompute_method)
+        layers_per_chunk = 1 if recompute_method == "block" else block.config.recompute_num_layers
+
+        # pytree does not flatten an unregistered dataclass, so the recompute would close over
+        # a tensor in it that requires grad. The eager loop takes it, full recompute rejects it.
+        reference = _run(_build_block(_DataclassConditionedLayer), make_layer_kwargs=unregistered)
+        assert reference["embedder_grad"].abs().sum() > 0
+        with pytest.raises(ValueError, match="register_dataclass"):
+            _run(block, make_layer_kwargs=unregistered)
+
+        # Closed-over tensors that need no gradients, e.g. masks, are fine.
+        reference = _run(
+            _build_block(_DataclassConditionedLayer), make_layer_kwargs=unregistered_without_grad
+        )
+        result = _run(block, make_layer_kwargs=unregistered_without_grad)
+        assert result["embedder_grad"] is None
+        _assert_bitwise_equal(result["output"], reference["output"])
+        _assert_same_grads(result, reference, layers_per_chunk)
+
+        # A registered dataclass is flattened: its tensors are checkpoint inputs.
+        reference = _run(_build_block(_DataclassConditionedLayer), make_layer_kwargs=registered)
+        result = _run(block, make_layer_kwargs=registered)
+        assert result["embedder_grad"].abs().sum() > 0
+        _assert_bitwise_equal(result["output"], reference["output"])
+        _assert_same_grads(result, reference, layers_per_chunk)
+
+    @pytest.mark.parametrize("recompute_method", ["block", "uniform"])
+    def test_custom_layer_gets_block_arguments(self, recompute_method):
+        # A BaseTransformerLayer that is not a TransformerLayer is called like a TransformerLayer
+        # under full recompute, as in the eager loop: it gets context, attention_bias and
+        # padding_mask.
+        def run(block):
+            generator = torch.Generator(device="cuda").manual_seed(7)
+            shape = (SEQ_LEN, MICRO_BATCH, HIDDEN)
+            hidden_states = torch.randn(shape, device="cuda", generator=generator)
+            context = torch.randn(shape, device="cuda", generator=generator)
+            attention_bias = torch.randn((HIDDEN,), device="cuda", generator=generator)
+            padding_mask = torch.rand((MICRO_BATCH, SEQ_LEN), device="cuda", generator=generator)
+            padding_mask = padding_mask < 0.25
+            hidden_states.requires_grad_(True)
+            context.requires_grad_(True)
+            output = block(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                context=context,
+                attention_bias=attention_bias,
+                padding_mask=padding_mask,
+            )
+            output.float().pow(2).mean().backward()
+            grads = {name: param.grad for name, param in block.named_parameters()}
+            received = [layer.received for layer in block.layers]
+            return output, hidden_states.grad, context.grad, grads, received
+
+        everything = ("context", "attention_bias", "padding_mask")
+        ref_output, ref_input_grad, ref_context_grad, ref_grads, ref_received = run(
+            _build_block(_BlockArgumentsLayer)
+        )
+        assert ref_received == [[everything]] * NUM_LAYERS
+        output, input_grad, context_grad, grads, received = run(
+            _build_block(_BlockArgumentsLayer, recompute_method)
+        )
+        # Both the forward call and the recompute get the arguments.
+        assert received == [[everything, everything]] * NUM_LAYERS
+        _assert_bitwise_equal(output, ref_output)
+        _assert_bitwise_equal(input_grad, ref_input_grad)
+        for name, grad in ref_grads.items():
+            _assert_bitwise_equal(grads[name], grad)
+        # Every layer reads the context, so only the summation order of its gradient differs.
+        _assert_equal_up_to_summation_order(context_grad, ref_context_grad, autocast=False)
 
     @pytest.mark.skipif(not HAVE_TE, reason="CPU offloading needs Transformer Engine")
     @pytest.mark.parametrize("autocast", [False, True], ids=["fp32", "autocast-bf16"])
