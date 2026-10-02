@@ -229,9 +229,21 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
+            # Token counts of the last global batch, reduced over TPxCPxDP. Written by
+            # finalize_model_grads when it updates the expert bias, for load-balance metrics.
+            self.register_buffer(
+                'last_global_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
+            self.last_global_tokens_per_expert = None
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -332,6 +344,7 @@ class TopKRouter(Router):
         self.enable_expert_bias = False
         self.local_tokens_per_expert = None
         self.expert_bias = None
+        self.last_global_tokens_per_expert = None
 
     def _maintain_float32_expert_bias(self):
         """
@@ -350,6 +363,17 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+
+    def _apply(self, fn, recurse=True):
+        """Apply `fn` to the parameters and buffers, then keep the routing biases in fp32.
+
+        Module dtype casts (e.g. `.to(torch.bfloat16)` or Float16Module) would otherwise leave the
+        biases in low precision until the next forward pass, so that values written into them
+        before that (e.g. when copying weights into a teacher model) would be rounded.
+        """
+        super()._apply(fn, recurse)
+        self._maintain_float32_expert_bias()
+        return self
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.

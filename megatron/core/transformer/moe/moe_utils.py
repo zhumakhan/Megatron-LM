@@ -1227,7 +1227,8 @@ def get_updated_expert_bias(
     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
 
     Args:
-        tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
+        tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert. It is
+            all-reduced in place, so it holds the global counts on return.
         expert_bias (torch.Tensor): The bias for each expert.
         expert_bias_udpate_rate (float): The update rate for the expert bias.
         tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,

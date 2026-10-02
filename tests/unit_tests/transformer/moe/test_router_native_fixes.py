@@ -5,6 +5,8 @@
 - Router gating with input and weight dtypes that differ.
 - Router gating, the router and the shared experts on 0 tokens.
 - Top-k probabilities that do not depend on the grad mode.
+- The expert bias staying fp32 under module dtype casts.
+- The global token counts that the expert-bias update keeps for metrics.
 
 `_ReferenceRouter` is a verbatim copy of a downstream router that these fixes let `TopKRouter`
 replace bit for bit.
@@ -17,11 +19,16 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.distributed.finalize_model_grads import (
+    _update_router_expert_bias,
+    reset_model_temporary_tensors,
+)
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     router_gating_linear,
@@ -304,6 +311,85 @@ class TestRouterNativeFixes:
             assert param.grad is not None, name
             if num_tokens == 0:
                 assert not param.grad.any(), name
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_stays_fp32_under_module_casts(self):
+        router = _router(_config())
+        assert router.expert_bias.dtype == torch.float32
+        router.to(torch.bfloat16)
+        assert router.expert_bias.dtype == torch.float32
+        assert router.weight.dtype == torch.bfloat16
+        assert router.local_tokens_per_expert.dtype == torch.int64
+        assert router.last_global_tokens_per_expert.dtype == torch.int64
+        # Values written after the cast keep full precision (e.g. copying a teacher's weights).
+        values = torch.rand(NUM_EXPERTS, device="cuda", dtype=torch.float64).float() * 1e-3 + 1
+        router.expert_bias.copy_(values)
+        assert torch.equal(router.expert_bias, values)
+        router.half()
+        assert router.expert_bias.dtype == torch.float32
+        wrapped = Float16Module(_config(), _router(_config()))
+        assert wrapped.module.expert_bias.dtype == torch.float32
+
+        quantile_router = _router(
+            _config(
+                moe_router_load_balancing_type="quantile_balancing",
+                moe_router_enable_expert_bias=False,
+            )
+        )
+        quantile_router.to(torch.bfloat16)
+        assert quantile_router.qb_beta.dtype == torch.float32
+        assert quantile_router.qb_beta_accum.dtype == torch.float32
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_last_global_tokens_per_expert_buffer(self):
+        router = _router(_config())
+        assert "last_global_tokens_per_expert" not in router.state_dict()
+        assert torch.equal(
+            router.last_global_tokens_per_expert,
+            torch.zeros(NUM_EXPERTS, dtype=torch.int64, device="cuda"),
+        )
+        router = _router(_config(moe_router_enable_expert_bias=False))
+        assert router.last_global_tokens_per_expert is None
+
+
+class TestLastGlobalTokensPerExpert:
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    def test_update_keeps_the_reduced_counts(self, tp_size):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = _config(moe_router_bias_update_rate=1e-3)
+        routers = torch.nn.ModuleList([_router(config), _router(config)])
+        frozen = _router(config)
+        frozen.eval()
+        generator = torch.Generator(device="cuda").manual_seed(torch.distributed.get_rank())
+        for router in [*routers, frozen]:
+            for _ in range(2):
+                hidden = torch.randn(32, 2, HIDDEN, device="cuda", generator=generator)
+                router(hidden.bfloat16())
+        group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        expected = [router.local_tokens_per_expert.clone() for router in routers]
+        for counts in expected:
+            assert counts.sum() == 2 * 32 * 2 * TOPK
+            torch.distributed.all_reduce(counts, group=group)
+        biases = [router.expert_bias.clone() for router in routers]
+
+        _update_router_expert_bias([routers], config, tp_dp_cp_group=group)
+        for router, counts, bias in zip(routers, expected, biases):
+            assert torch.equal(router.last_global_tokens_per_expert, counts)
+            # The local counters are reset only afterwards.
+            assert not torch.equal(router.local_tokens_per_expert, counts)
+            direction = torch.sign(counts.sum() - counts * NUM_EXPERTS).float()
+            assert torch.equal(router.expert_bias, bias + direction * 1e-3)
+        assert not frozen.last_global_tokens_per_expert.any()
+
+        reset_model_temporary_tensors(config, [routers])
+        for router, counts in zip(routers, expected):
+            assert not router.local_tokens_per_expert.any()
+            assert torch.equal(router.last_global_tokens_per_expert, counts)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
