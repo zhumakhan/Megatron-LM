@@ -125,10 +125,7 @@ def _run(layer, hidden, router_input, grad_output, side_channel=False, **kwargs)
     output.backward(grad_output)
     grads = {name: p.grad.clone() for name, p in layer.named_parameters() if p.grad is not None}
     aux = get_moe_metrics_tracker().metrics["seq_load_balancing_loss"].values.clone()
-    state = {
-        "local_tokens_per_expert": layer.router.local_tokens_per_expert.clone(),
-        "aux": aux,
-    }
+    state = {"local_tokens_per_expert": layer.router.local_tokens_per_expert.clone(), "aux": aux}
     layer.zero_grad(set_to_none=True)
     layer.router.local_tokens_per_expert.zero_()
     return output.detach(), hidden.grad, router_input.grad, grads, state
