@@ -264,8 +264,11 @@ def z_loss_func(
         # Compute mean over valid tokens only
         num_valid_tokens = valid_mask.sum()
         z_loss = z_loss_values.sum() / torch.clamp(num_valid_tokens, min=1.0) * z_loss_coeff
-    else:
+    elif z_loss_values.numel() > 0:
         z_loss = torch.mean(z_loss_values) * z_loss_coeff
+    else:
+        # The mean over 0 tokens is NaN; their z-loss is 0, as for tokens that are all padding.
+        z_loss = z_loss_values.sum() * z_loss_coeff
     return z_loss
 
 

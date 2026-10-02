@@ -3,7 +3,7 @@
 """Tests for router and MoE robustness fixes.
 
 - Router gating with input and weight dtypes that differ.
-- Router gating, the router and the shared experts on 0 tokens.
+- Router gating, the router, its z-loss and the shared experts on 0 tokens.
 - Top-k probabilities that do not depend on the grad mode.
 - The expert bias staying fp32 under module dtype casts.
 - The global token counts that the expert-bias update keeps for metrics.
@@ -29,10 +29,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     router_gating_linear,
     topk_routing_with_score_function,
+    z_loss_func,
 )
 from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
@@ -283,6 +285,36 @@ class TestRouterNativeFixes:
         assert torch.equal(router.weight.grad, torch.zeros_like(router.weight))
         assert hidden.grad.shape == hidden.shape
         assert not router.local_tokens_per_expert.any()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("with_padding_mask", [False, True])
+    def test_z_loss_on_zero_tokens(self, with_padding_mask):
+        """The z-loss of 0 tokens is 0 rather than NaN, so that a router without tokens logs a
+        finite value; the z-loss of tokens is unchanged."""
+        padding_mask = None
+        if with_padding_mask:
+            padding_mask = torch.zeros(0, dtype=torch.bool, device="cuda")
+        logits = torch.randn(0, NUM_EXPERTS, device="cuda", requires_grad=True)
+        z_loss = z_loss_func(logits, 1e-3, padding_mask=padding_mask)
+        assert torch.equal(z_loss, torch.zeros_like(z_loss))
+        z_loss.backward()
+        assert logits.grad.shape == logits.shape
+        logits = torch.randn(64, NUM_EXPERTS, device="cuda")
+        expected = torch.mean(torch.square(torch.logsumexp(logits, dim=-1))) * 1e-3
+        assert torch.equal(z_loss_func(logits, 1e-3), expected)
+
+        router = _router(_config(moe_z_loss_coeff=1e-3))
+        tracker = get_moe_metrics_tracker()
+        tracker.clear()
+        hidden = torch.empty(0, 1, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        hidden.requires_grad_(True)
+        router_padding_mask = None if padding_mask is None else padding_mask.view(0, 1)
+        probs, _ = router(hidden, padding_mask=router_padding_mask)
+        probs.sum().backward()
+        logged = tracker.metrics["z_loss"].values
+        assert torch.equal(logged, torch.zeros_like(logged))
+        assert torch.equal(router.weight.grad, torch.zeros_like(router.weight))
+        tracker.clear()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("num_tokens", [0, 7])
