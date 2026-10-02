@@ -85,7 +85,7 @@ def _config(**overrides):
     return dataclasses.replace(config, **overrides)
 
 
-def _layer(config, cls=MoELayer, source=None):
+def _layer(config, cls=MoELayer, source=None, strict=True):
     submodules = get_submodules(
         get_gpt_layer_with_transformer_engine_submodules(
             num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm
@@ -97,7 +97,7 @@ def _layer(config, cls=MoELayer, source=None):
         with torch.no_grad():
             layer.router.expert_bias.copy_(torch.randn_like(layer.router.expert_bias) * 0.05)
     else:
-        layer.load_state_dict(source.state_dict())
+        layer.load_state_dict(source.state_dict(), strict=strict)
     layer.train()
     return layer
 
@@ -319,3 +319,83 @@ class TestMoELayerRouterInput:
         hidden, router_input, _ = _inputs(seed=9)
         with pytest.raises(ValueError, match="leading shape"):
             layer(hidden, router_input=router_input[:-1])
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_compacted_tokens_with_the_shared_expert_outside_the_layer(self):
+        """With TP > 1 and sequence parallelism, the shared expert of the layer all-gathers
+        equal-size shards, so compacted inputs whose token count differs between the TP ranks
+        (one rank has none here) need the shared expert outside of the layer, as documented in
+        MoELayer.forward: `shared_experts_compute` returns None and `shared_experts` runs on the
+        uncompacted shard. The routed part equals that of a layer without a shared expert."""
+
+        class ExternalSharedExpertMoELayer(MoELayer):
+            def shared_experts_compute(self, hidden_states):
+                return None
+
+        self._init(2, 2)
+        config = _config()
+        assert config.sequence_parallel and config.moe_shared_expert_intermediate_size
+        layer = _layer(config, ExternalSharedExpertMoELayer)
+        reference = _layer(
+            dataclasses.replace(config, moe_shared_expert_intermediate_size=None),
+            source=layer,
+            strict=False,
+        )
+        assert reference.shared_experts is None
+        extra_keys = set(layer.state_dict()) - set(reference.state_dict())
+        assert extra_keys and all(key.startswith("shared_experts.") for key in extra_keys)
+
+        rank = torch.distributed.get_rank()
+        seq_length, batch = 8, 2
+        hidden, router_input, grad_output = _inputs(seed=rank, seq_length=seq_length, batch=batch)
+        generator = torch.Generator(device="cuda").manual_seed(rank)
+        num_valid = (11, 0, 5, 16, 9, 3, 7, 12)[rank]
+        order = torch.randperm(seq_length * batch, device="cuda", generator=generator)
+        valid = (order < num_valid).view(seq_length, batch)
+        selected = valid.reshape(-1).nonzero(as_tuple=False).flatten()
+        shared_experts = layer.shared_experts
+
+        def run(moe_layer):
+            MoEAuxLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
+            get_moe_metrics_tracker().clear()
+            x = hidden.detach().clone().requires_grad_(True)
+            r = router_input.detach().clone().requires_grad_(True)
+            routed, _ = moe_layer(
+                x.reshape(-1, HIDDEN)[selected].unsqueeze(1),
+                router_input=r.reshape(-1, HIDDEN)[selected].unsqueeze(1),
+                sequence_ids=selected % batch,
+                num_sequences=batch,
+            )
+            assert routed.shape == (num_valid, 1, HIDDEN)
+            output = torch.zeros_like(x).reshape(-1, HIDDEN)
+            output = output.index_copy(0, selected, routed[:, 0]).view_as(x)
+            output = output + shared_experts(x).masked_fill(~valid[..., None], 0)
+            output.backward(grad_output)
+            grads = {
+                name: param.grad.clone()
+                for name, param in moe_layer.named_parameters()
+                if param.grad is not None and not name.startswith("shared_experts.")
+            }
+            shared_grads = {name: p.grad.clone() for name, p in shared_experts.named_parameters()}
+            aux = get_moe_metrics_tracker().metrics["seq_load_balancing_loss"].values.clone()
+            moe_layer.zero_grad(set_to_none=True)
+            shared_experts.zero_grad(set_to_none=True)
+            return output.detach(), x.grad, r.grad, grads, shared_grads, aux
+
+        with _deterministic_algorithms():
+            expected = run(reference)
+            actual = run(layer)
+        for name, value, reference_value in zip(
+            ("output", "hidden grad", "router_input grad"), actual[:3], expected[:3]
+        ):
+            assert torch.equal(value, reference_value), name
+        assert "router.weight" in actual[3]
+        for grads, reference_grads in zip(actual[3:5], expected[3:5]):
+            assert grads.keys() == reference_grads.keys()
+            for name in grads:
+                assert torch.isfinite(grads[name]).all(), name
+                assert torch.equal(grads[name], reference_grads[name]), name
+        # Every TP pair has valid tokens, so every shard of the shared expert gets a gradient.
+        assert all(grad.any() for grad in actual[4].values())
+        assert torch.equal(actual[5], expected[5]) and actual[5].sum() > 0
+        get_moe_metrics_tracker().clear()

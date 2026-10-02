@@ -713,6 +713,16 @@ class MoELayer(BaseMoELayer):
         3. Expert Computation: Experts process the dispatched tokens.
         4. Combine: The outputs from the experts are combined and returned.
 
+        The number of tokens may differ between ranks and be 0 on some of them, e.g. for inputs
+        compacted to their valid tokens ([num_tokens, 1, hidden_size]). The top-k router (with
+        z-loss, expert bias and the per-sequence seq_aux_loss), the 'alltoall' token dispatcher
+        and the experts support that. Components that all-gather equal-size shards do not, and
+        their collectives hang or fail on unequal counts: the 'allgather' token dispatcher (over
+        the TP x EP ranks) and, with sequence parallelism and TP > 1, the shared expert of this
+        layer (over the TP ranks). For such inputs, compute the shared expert outside of this
+        layer on equal-size shards (e.g. override `shared_experts_compute` to return None and
+        apply `shared_experts` to the uncompacted hidden states), or build the layer without one.
+
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
