@@ -274,6 +274,13 @@ class TransformerConfig(ModelParallelConfig):
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
 
+    rope_freqs_per_token: bool = False
+    """If True, the rotary frequencies passed with THD packed sequences hold one row per packed
+    token (``[t, 1, 1, d]``, row i rotates token i, e.g. precomputed multi-axis coordinates), so
+    positions do not restart at each sequence start. The THD tensor is then rotated as a
+    ``[t, 1, h, d]`` sbhd view (fused or unfused). If False, THD frequencies are indexed by the
+    position within each sequence. Requires context_parallel_size == 1."""
+
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
@@ -3858,6 +3865,9 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_comm_type='ulysses' does not support qk_clip or "
                         "log_max_attention_logit."
                     )
+
+        if self.rope_freqs_per_token and self.context_parallel_size > 1:
+            raise ValueError("rope_freqs_per_token requires context_parallel_size == 1.")
 
         assert (
             self.pipeline_model_parallel_size > 0

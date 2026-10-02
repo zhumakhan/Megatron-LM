@@ -559,3 +559,26 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_te_fused_rope_per_token_thd_replays_fwd_bwd():
+    """rope_freqs_per_token: THD tokens rotated by one frequency row each (sbhd-view kernel)."""
+    from megatron.core.models.common.embeddings import rope_utils
+
+    if rope_utils.fused_apply_rotary_pos_emb is None:
+        pytest.skip("TE fused RoPE unavailable")
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        config = _config(apply_rope_fusion=True, rope_freqs_per_token=True)
+        s, h, d = 4096, 32, 128
+        freqs = torch.rand(s, 1, 1, d, device="cuda") * 1000
+        t = torch.randn(s, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        cu_seqlens = torch.tensor([0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda")
+
+        def fn(t):
+            return rope_utils.apply_rotary_pos_emb(t, freqs, config, cu_seqlens=cu_seqlens)
+
+        assert_replays_bit_exact(fn, (t,), replays=3, what="TE fused RoPE[thd, per-token]")
+    finally:
+        Utils.destroy_model_parallel()
