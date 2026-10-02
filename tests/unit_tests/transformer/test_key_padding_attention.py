@@ -212,6 +212,80 @@ class TestKeyPaddingAttention:
         with pytest.raises(AssertionError, match=r"\[b, 1, 1, sk\]"):
             attention(*inputs, dense, attn_mask_type=AttnMaskType.key_padding)
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_shared_mask_matches_per_sample_masks(self, dtype, monkeypatch):
+        """A [1, 1, 1, sk] mask applies to every sample, exactly like its [b, 1, 1, sk] copy."""
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        batch = 4
+        mask = _mask()[1:2]  # registers, 7 of 28 caption tokens, video
+        per_sample = mask.expand(batch, -1, -1, -1).contiguous()
+        inputs = _inputs(batch, dtype)
+        grad_output = torch.randn(SEQUENCE, batch, HEADS * HEAD_DIM, device="cuda", dtype=dtype)
+        attention = _te_attention(_config(bf16=dtype == torch.bfloat16, params_dtype=dtype))
+        kwargs = dict(attn_mask_type=AttnMaskType.key_padding)
+        shared = _run(attention, inputs, mask, grad_output, **kwargs)
+        expected = _run(attention, inputs, per_sample, grad_output, **kwargs)
+        for name, actual, reference in zip(("output", "dq", "dk", "dv"), shared, expected):
+            _assert_bitwise(actual, reference, f"{dtype} {name}")
+        reference, _ = _sdpa_reference(*inputs, per_sample)
+        error = _relative_error(shared[0], reference)
+        assert error < (1e-2 if dtype == torch.bfloat16 else 2e-3), f"relative error {error}"
+
+    @pytest.mark.parametrize("backend", ["te_bf16", "te_fp32", "local"])
+    def test_rejects_masks_of_other_batch_or_length(self, backend):
+        """A mask must cover every key and have the batch size of the inputs (or 1)."""
+        dtype = torch.float32 if backend == "te_fp32" else torch.bfloat16
+        config = _config(bf16=dtype == torch.bfloat16, params_dtype=dtype)
+        if backend == "local":
+            attention = DotProductAttention(
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.key_padding,
+                attention_type="self",
+            )
+        else:
+            attention = _te_attention(config)
+        inputs = _inputs(4, dtype)
+        two_samples = torch.zeros(2, 1, 1, SEQUENCE, dtype=torch.bool, device="cuda")
+        with pytest.raises(AssertionError, match="batch size 2"):
+            attention(*inputs, two_samples, attn_mask_type=AttnMaskType.key_padding)
+        short = torch.zeros(4, 1, 1, SEQUENCE - 8, dtype=torch.bool, device="cuda")
+        with pytest.raises(AssertionError, match=f"covers {SEQUENCE - 8} keys"):
+            attention(*inputs, short, attn_mask_type=AttnMaskType.key_padding)
+
+    def test_rejects_sliding_window_attention(self):
+        """The varlen call compacts keys, so a window would shift: key_padding rejects windows."""
+        mask = _mask()
+        inputs = _inputs(mask.shape[0], torch.bfloat16)
+        windowed = _config(window_size=(8, 8))
+        with pytest.raises(ValueError, match="sliding window"):
+            _te_attention(windowed)
+        with pytest.raises(ValueError, match="sliding window"):
+            DotProductAttention(
+                windowed,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.key_padding,
+                attention_type="self",
+            )
+        # Per-call key_padding masks on windowed layers built for another mask type.
+        local = DotProductAttention(
+            windowed, layer_number=1, attn_mask_type=AttnMaskType.arbitrary, attention_type="self"
+        )
+        for attention in (_te_attention(windowed, AttnMaskType.arbitrary), local):
+            with pytest.raises(ValueError, match="sliding window"):
+                attention(*inputs, mask, attn_mask_type=AttnMaskType.key_padding)
+        # Layers without a window (window_attn_skip_freq) keep supporting key_padding.
+        unwindowed_layer = TEDotProductAttention(
+            config=_config(window_size=(8, 8), window_attn_skip_freq=2),
+            layer_number=2,
+            attn_mask_type=AttnMaskType.key_padding,
+            attention_type="self",
+            pg_collection=_pg_collection(),
+        )
+        output = unwindowed_layer(*inputs, mask, attn_mask_type=AttnMaskType.key_padding)
+        expected, _ = _sdpa_reference(*inputs, mask)
+        assert _relative_error(output, expected) < 1e-2
+
     def test_no_mask_runs_unmasked(self):
         inputs = _inputs(2, torch.bfloat16)
         attention = _te_attention(_config())
@@ -326,6 +400,64 @@ class TestKeyPaddingAttention:
         )
         get_key_padding_metadata(mask.clone(), SEQUENCE)
         assert len(builds) == 4
+
+    @pytest.mark.parametrize("refresh", ["increment_version", "clear_cache"])
+    def test_metadata_refreshed_after_untracked_mask_write(self, refresh):
+        """A mask buffer refilled in place without a version bump (a collective, ``.data``).
+
+        Such writes are invisible to the cache, like to autograd; increment_version or a cache
+        clear after the write must give the metadata of the new mask contents.
+        """
+        mask = _mask()
+        expected = transformer_utils._build_key_padding_metadata(mask, SEQUENCE)
+        buffer = torch.zeros_like(mask)  # the previous step's mask: every key valid
+        previous = get_key_padding_metadata(buffer, SEQUENCE)
+        version = buffer._version
+        # Refill the buffer in place: rank 0 through .data, the other ranks by an NCCL broadcast.
+        if torch.distributed.get_rank() == 0:
+            buffer.data.copy_(mask)
+        torch.distributed.broadcast(buffer, src=0)
+        assert torch.equal(buffer, mask)
+        if refresh == "increment_version":
+            torch.autograd.graph.increment_version(buffer)
+            assert buffer._version > version
+        else:
+            clear_key_padding_metadata_cache()
+        refreshed = get_key_padding_metadata(buffer, SEQUENCE)
+        assert refreshed is not previous
+        for name in ("sbhd_kv_index", "bshd_kv_index", "cu_seqlens_q", "cu_seqlens_kv", "empty"):
+            assert torch.equal(getattr(refreshed, name), getattr(expected, name)), name
+
+    def test_metadata_not_cached_in_inference_mode(self, monkeypatch):
+        """Metadata built under inference_mode is not cached: a later training call can save it."""
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        builds = []
+        build = transformer_utils._build_key_padding_metadata
+        monkeypatch.setattr(
+            transformer_utils,
+            "_build_key_padding_metadata",
+            lambda *args: builds.append(args) or build(*args),
+        )
+        mask = _mask()
+        inputs = _inputs(mask.shape[0], torch.bfloat16)
+        grad_output = torch.randn(
+            SEQUENCE, mask.shape[0], HEADS * HEAD_DIM, device="cuda", dtype=torch.bfloat16
+        )
+        attention = _te_attention(_config())
+        with torch.inference_mode():
+            inference_output = attention(*inputs, mask, attn_mask_type=AttnMaskType.key_padding)
+            attention(*inputs, mask, attn_mask_type=AttnMaskType.key_padding)
+        assert len(builds) == 2
+        # Training forward/backward with the same (normal) mask tensor.
+        actual = _run(attention, inputs, mask, grad_output, attn_mask_type=AttnMaskType.key_padding)
+        assert len(builds) == 3
+        clear_key_padding_metadata_cache()
+        expected = _run(
+            attention, inputs, mask, grad_output, attn_mask_type=AttnMaskType.key_padding
+        )
+        for name, a, e in zip(("output", "dq", "dk", "dv"), actual, expected):
+            _assert_bitwise(a, e, f"after inference_mode: {name}")
+        _assert_bitwise(inference_output.clone(), expected[0], "inference_mode output")
 
     def test_metadata_layout(self):
         mask = _mask()

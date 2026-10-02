@@ -18,6 +18,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     attention_mask_func,
     check_key_padding_mask,
+    check_key_padding_window,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
     ulysses_attention,
@@ -41,8 +42,9 @@ class DotProductAttention(MegatronModule):
      b: batch size
      s: sequence length
 
-    AttnMaskType.key_padding masks (``[b, 1, 1, sk]``) are broadcast over the queries like an
-    arbitrary mask, and the output rows of samples without a valid key are zeroed. Context
+    AttnMaskType.key_padding masks (``[b, 1, 1, sk]``, or ``[1, 1, 1, sk]`` for every sample) are
+    broadcast over the queries like an arbitrary mask, and the output rows of samples without a
+    valid key are zeroed; layers with sliding window attention do not support them. Context
     parallelism is supported with cp_comm_type='ulysses' only (see
     TransformerConfig.cp_comm_type).
     """
@@ -123,6 +125,8 @@ class DotProductAttention(MegatronModule):
             window_size = self.config.window_size
         else:
             window_size = None
+        if attn_mask_type == AttnMaskType.key_padding:
+            check_key_padding_window(window_size is not None)
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
@@ -219,10 +223,12 @@ class DotProductAttention(MegatronModule):
         empty_samples = None
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
+        if attn_mask_type == AttnMaskType.key_padding:
+            check_key_padding_window(self.scale_mask_softmax.window_size is not None)
         if attn_mask_type == AttnMaskType.key_padding and attention_mask is not None:
             # A [b, 1, 1, sk] key mask: broadcast it over the queries (the fused softmax kernel
             # reads a dense [b, 1, sq, sk] mask) and zero the rows of samples without valid keys.
-            check_key_padding_mask(attention_mask)
+            check_key_padding_mask(attention_mask, query.size(1), key.size(0))
             empty_samples = attention_mask.all(dim=-1).view(1, -1, 1)
             attention_mask = attention_mask.expand(-1, -1, query.size(0), -1).contiguous()
 

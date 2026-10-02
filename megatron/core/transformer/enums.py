@@ -42,9 +42,10 @@ class AttnType(enum.Enum):
 class AttnMaskType(enum.Enum):
     """Attention Mask Type
 
-    key_padding: a [b, 1, 1, sk] boolean mask (True = ignore that key) whose masked keys may sit
-    anywhere in the sequence (holes are allowed); queries are never masked. Output rows of a
-    sample without any valid key are zero.
+    key_padding: a [b, 1, 1, sk] boolean mask (True = ignore that key), or [1, 1, 1, sk] for one
+    mask shared by every sample, whose masked keys may sit anywhere in the sequence (holes are
+    allowed); queries are never masked. Output rows of a sample without any valid key are zero.
+    Not supported on layers with sliding window attention.
     """
 
     padding = 1

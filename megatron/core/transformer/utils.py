@@ -116,8 +116,18 @@ def attention_mask_func(attention_scores, attention_mask):
     return attention_scores
 
 
-def check_key_padding_mask(attention_mask: torch.Tensor) -> None:
-    """Check that ``attention_mask`` is a ``[b, 1, 1, sk]`` boolean key-padding mask."""
+def check_key_padding_mask(
+    attention_mask: torch.Tensor, batch_size: Optional[int] = None, key_length: Optional[int] = None
+) -> None:
+    """Check that ``attention_mask`` is a ``[b, 1, 1, sk]`` boolean key-padding mask.
+
+    Args:
+        attention_mask (Tensor): the mask, True = ignore that key.
+        batch_size (int, optional): batch size of the attention inputs. The mask must have this
+            batch size, or batch size 1 for one mask shared by every sample.
+        key_length (int, optional): number of keys of the attention inputs, which the mask
+            must cover.
+    """
     assert (
         attention_mask.dim() == 4
         and attention_mask.shape[1] == 1
@@ -127,6 +137,28 @@ def check_key_padding_mask(attention_mask: torch.Tensor) -> None:
         "AttnMaskType.key_padding expects a [b, 1, 1, sk] bool attention mask, got "
         f"{tuple(attention_mask.shape)} {attention_mask.dtype}"
     )
+    assert batch_size is None or attention_mask.shape[0] in (1, batch_size), (
+        f"key_padding mask has batch size {attention_mask.shape[0]}, but the attention inputs "
+        f"have batch size {batch_size} (expected {batch_size} or 1)"
+    )
+    assert key_length is None or attention_mask.shape[-1] == key_length, (
+        f"key_padding mask covers {attention_mask.shape[-1]} keys, but the attention inputs "
+        f"have {key_length} keys"
+    )
+
+
+def check_key_padding_window(sliding_window: bool) -> None:
+    """Reject AttnMaskType.key_padding on a layer with sliding window attention.
+
+    Args:
+        sliding_window (bool): whether the layer applies sliding window attention.
+    """
+    if sliding_window:
+        raise ValueError(
+            "AttnMaskType.key_padding does not support sliding window attention (window_size): "
+            "the varlen kernel would apply the window to compacted key positions. Use "
+            "AttnMaskType.arbitrary with a dense mask on windowed layers."
+        )
 
 
 def key_padding_safe_mask(attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -179,7 +211,12 @@ _key_padding_metadata_cache: "OrderedDict[tuple, Tuple[torch.Tensor, KeyPaddingM
 
 
 def clear_key_padding_metadata_cache() -> None:
-    """Drop all cached key-padding metadata and the masks the cache keeps alive."""
+    """Drop all cached key-padding metadata and the masks the cache keeps alive.
+
+    Call it after writing a cached mask in a way that does not bump its version counter (see
+    :func:`get_key_padding_metadata`), e.g. once per step when a persistent mask buffer is
+    refilled by a collective.
+    """
     _key_padding_metadata_cache.clear()
 
 
@@ -215,16 +252,27 @@ def get_key_padding_metadata(attention_mask: torch.Tensor, query_length: int) ->
     device), so every layer that receives the same mask, and the activation-checkpoint
     recompute (which receives detached aliases of the same storage), reuse a single
     ``nonzero`` and its device-to-host synchronization. A cached mask is kept alive, so its
-    storage cannot be reused by another tensor while the entry exists, and in-place updates of
-    the mask (or of a view of it) bump its version and invalidate the entry.
+    storage cannot be reused by another tensor while the entry exists.
+
+    Like autograd's checks of saved tensors, the cache relies on the mask's version counter:
+    in-place PyTorch operations on the mask (or on a view of it) bump the version and
+    invalidate the entry, but writes that bypass the version counter go unnoticed and would
+    return stale metadata. Such writes include ``torch.distributed`` collectives into an
+    existing mask buffer (``broadcast``, ``all_gather_into_tensor``, ...), custom CUDA or
+    Triton kernels, and writes through ``.data`` or ``untyped_storage()``. After such a write,
+    call ``torch.autograd.graph.increment_version(mask)`` or
+    :func:`clear_key_padding_metadata_cache`, or pass a new mask tensor instead.
+
+    Masks that are inference tensors, and calls under ``torch.inference_mode()``, bypass the
+    cache: inference tensors have no version counter, and metadata built in inference mode
+    could not be saved for backward by a later training forward.
 
     Args:
         attention_mask (Tensor): ``[b, 1, 1, sk]`` boolean mask, True = ignore that key.
         query_length (int): number of queries per sample.
     """
     check_key_padding_mask(attention_mask)
-    if attention_mask.is_inference():
-        # Inference tensors have no version counter to validate a cache entry with.
+    if attention_mask.is_inference() or torch.is_inference_mode_enabled():
         return _build_key_padding_metadata(attention_mask, query_length)
     key = (
         attention_mask.data_ptr(),
