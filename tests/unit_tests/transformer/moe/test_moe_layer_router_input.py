@@ -247,31 +247,46 @@ class TestMoELayerRouterInput:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_sequence_ids_reach_the_router(self, monkeypatch):
-        """sequence_ids and num_sequences are forwarded to the router only when given."""
+        """sequence_ids and num_sequences are forwarded to the router and from there to its
+        `routing` only when given."""
         self._init(1, 1)
         layer = _layer(_config())
-        calls = []
-        forward = TopKRouter.forward
+        calls = {"forward": [], "routing": []}
+        forward, routing = TopKRouter.forward, TopKRouter.routing
 
-        def spy(router, *args, **kwargs):
-            calls.append(kwargs)
+        def forward_spy(router, *args, **kwargs):
+            calls["forward"].append(kwargs)
             return forward(router, *args, **kwargs)
 
-        monkeypatch.setattr(TopKRouter, "forward", spy)
+        def routing_spy(router, *args, **kwargs):
+            calls["routing"].append(kwargs)
+            return routing(router, *args, **kwargs)
+
+        monkeypatch.setattr(TopKRouter, "forward", forward_spy)
+        monkeypatch.setattr(TopKRouter, "routing", routing_spy)
         hidden, router_input, _ = _inputs(seed=3, seq_length=12, batch=1)
         ids = torch.arange(12, device="cuda") // 4
         layer(hidden, router_input=router_input, sequence_ids=ids, num_sequences=3)
         layer(hidden)
-        assert calls[0]["sequence_ids"] is ids and calls[0]["num_sequences"] == 3
-        assert "sequence_ids" not in calls[1] and "num_sequences" not in calls[1]
+        for kwargs in (calls["forward"][0], calls["routing"][0]):
+            assert kwargs["sequence_ids"] is ids and kwargs["num_sequences"] == 3
+        for kwargs in (calls["forward"][1], calls["routing"][1]):
+            assert "sequence_ids" not in kwargs and "num_sequences" not in kwargs
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_router_without_sequence_arguments_still_works(self):
-        """Routers with the original forward signature keep working when no ids are given."""
+    @pytest.mark.parametrize("override", ["forward", "routing", "routing_attribute"])
+    def test_routers_without_sequence_arguments_still_work(self, override):
+        """Routers whose `forward` or `routing` has the original signature, in a subclass or as
+        an instance attribute (as tests and tools patch it), keep working when no ids are
+        given, also with the per-sequence seq_aux_loss."""
 
-        class LegacyRouter(TopKRouter):
+        class LegacyForwardRouter(TopKRouter):
             def forward(self, input, padding_mask=None, input_ids=None):
                 return super().forward(input, padding_mask, input_ids)
+
+        class LegacyRoutingRouter(TopKRouter):
+            def routing(self, logits, padding_mask=None, input_ids=None):
+                return super().routing(logits, padding_mask=padding_mask, input_ids=input_ids)
 
         self._init(1, 1)
         submodules = get_submodules(
@@ -279,15 +294,23 @@ class TestMoELayerRouterInput:
                 num_experts=8, moe_grouped_gemm=True
             ).mlp
         )
-        submodules = dataclasses.replace(submodules, router=LegacyRouter)
-        layer = MoELayer(
-            _config(moe_router_load_balancing_type="none", moe_aux_loss_coeff=0.0),
-            submodules,
-            layer_number=1,
-        ).cuda()
+        router_cls = {"forward": LegacyForwardRouter, "routing": LegacyRoutingRouter}
+        submodules = dataclasses.replace(submodules, router=router_cls.get(override, TopKRouter))
+        layer = MoELayer(_config(), submodules, layer_number=1).cuda()
+        if override == "routing_attribute":
+            routing = layer.router.routing
+            layer.router.routing = lambda logits, padding_mask=None, input_ids=None: routing(
+                logits, padding_mask=padding_mask, input_ids=input_ids
+            )
         hidden, router_input, _ = _inputs(seed=5)
+        MoEAuxLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
+        get_moe_metrics_tracker().clear()
         output, _ = layer(hidden, router_input=router_input)
         assert output.shape == hidden.shape
+        assert get_moe_metrics_tracker().metrics["seq_load_balancing_loss"].values.sum() > 0
+        probs, routing_map = layer.router(router_input)
+        assert probs.shape == routing_map.shape == (hidden.shape[0] * hidden.shape[1], 8)
+        get_moe_metrics_tracker().clear()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_input_shape_is_validated(self):

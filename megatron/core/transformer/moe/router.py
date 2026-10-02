@@ -1205,7 +1205,9 @@ class TopKRouter(Router):
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
             sequence_ids (torch.Tensor, optional): Global sequence index of every token for the
-                per-sequence seq_aux_loss. See `routing`.
+                per-sequence seq_aux_loss. See `routing`. Passed on to `routing` only when it or
+                `num_sequences` is set, so that `routing` overrides without these arguments keep
+                working.
             num_sequences (int, optional): Global number of sequences. See `routing`.
         """
         self._maintain_float32_expert_bias()
@@ -1255,12 +1257,11 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
+        sequence_kwargs = {}
+        if sequence_ids is not None or num_sequences is not None:
+            sequence_kwargs = dict(sequence_ids=sequence_ids, num_sequences=num_sequences)
         probs, routing_map = self.routing(
-            logits,
-            padding_mask=padding_mask,
-            input_ids=input_ids,
-            sequence_ids=sequence_ids,
-            num_sequences=num_sequences,
+            logits, padding_mask=padding_mask, input_ids=input_ids, **sequence_kwargs
         )
 
         return probs, routing_map
