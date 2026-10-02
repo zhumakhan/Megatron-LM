@@ -104,6 +104,11 @@ class Router(ABC, MegatronModule):
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
 
+        An input whose dtype differs from the router weight (e.g. an fp32 router input with bf16
+        weights, or a bf16 input reaching fp32 weights) is first cast to the weight dtype, because
+        the gating GEMM does not accept mixed operand dtypes. With ``moe_router_dtype='fp64'`` both
+        operands are converted to fp64 and the input is left unchanged.
+
         Args:
             input (torch.Tensor): Input tensor.
 
@@ -115,6 +120,9 @@ class Router(ABC, MegatronModule):
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
+        if input.dtype != self.weight.dtype and self.config.moe_router_dtype != 'fp64':
+            input = input.to(self.weight.dtype)
 
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype

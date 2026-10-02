@@ -1423,7 +1423,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
                 bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
             )
 
-        output = output.view(*inp_shape[:-1], -1)
+        # Name the expert dimension explicitly: view(..., -1) is ambiguous for 0 tokens.
+        output = output.view(*inp_shape[:-1], weight.shape[0])
         return output
 
     @staticmethod

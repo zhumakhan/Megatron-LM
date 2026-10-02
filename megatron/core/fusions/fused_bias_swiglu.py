@@ -477,7 +477,8 @@ def bias_swiglu_impl(
             linear_clamp_scale,
         )
 
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    # Name the output width explicitly: view(..., -1) is ambiguous for 0 tokens.
+    return output if len(ori_shape) == 2 else output.view(*ori_shape[:2], output.shape[-1])
 
 
 def weighted_bias_swiglu_impl(
@@ -513,7 +514,8 @@ def weighted_bias_swiglu_impl(
             input, weights, fp8_input_store, clamp_value, gate_clamp_scale, linear_clamp_scale
         )
 
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    # Name the output width explicitly: view(..., -1) is ambiguous for 0 tokens.
+    return output if len(ori_shape) == 2 else output.view(*ori_shape[:2], output.shape[-1])
 
 
 # bias_swiglu_impl = BiasSwiGLUFunction.apply
