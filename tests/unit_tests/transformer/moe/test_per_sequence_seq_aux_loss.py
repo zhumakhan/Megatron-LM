@@ -439,15 +439,20 @@ class TestPerSequenceSeqAuxLossInMoELayer:
         num_tokens = 0 if rank == 3 else 5 + 3 * rank
         generator = torch.Generator(device="cuda").manual_seed(rank)
         hidden = torch.randn(num_tokens, 1, 64, device="cuda", generator=generator).bfloat16()
+        router_input = torch.randn(num_tokens, 1, 64, device="cuda", generator=generator)
         hidden.requires_grad_(True)
+        router_input = router_input.bfloat16().requires_grad_(True)
         sequence_ids = torch.arange(num_tokens, device="cuda") % 4
 
         MoEAuxLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
         get_moe_metrics_tracker().clear()
-        output, _ = layer(hidden, sequence_ids=sequence_ids, num_sequences=4)
+        output, _ = layer(
+            hidden, router_input=router_input, sequence_ids=sequence_ids, num_sequences=4
+        )
         assert output.shape == hidden.shape
         output.float().sum().backward()
         assert hidden.grad.shape == hidden.shape
+        assert router_input.grad.shape == router_input.shape
         for name, param in layer.named_parameters():
             assert param.grad is not None, name
             assert torch.isfinite(param.grad).all(), name

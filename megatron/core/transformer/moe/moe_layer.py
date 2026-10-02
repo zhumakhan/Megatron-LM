@@ -14,6 +14,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -516,7 +517,8 @@ class MoELayer(BaseMoELayer):
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping. The input padding mask is batch-first;
-        routing consumes it sequence-first to align with ``hidden_states``.
+        routing consumes it sequence-first to align with ``hidden_states``. ``hidden_states`` is
+        the router input, which ``forward`` replaces by its ``router_input`` when given.
         ``sequence_ids`` and ``num_sequences`` are passed to the router only when set, so that
         routers without per-sequence load balancing need not accept them.
         """
@@ -699,6 +701,7 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         *,
+        router_input: Optional[torch.Tensor] = None,
         sequence_ids: Optional[torch.Tensor] = None,
         num_sequences: Optional[int] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -717,6 +720,12 @@ class MoELayer(BaseMoELayer):
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape
                 [batch_size, seq_length]. Required by hash routing.
+            router_input (torch.Tensor, optional): Tensor that the router reads instead of
+                `hidden_states` (gating, z-loss, aux losses and expert-bias counters), e.g. the
+                hidden states before a modulation that only the experts should see. It must have
+                the leading shape of `hidden_states` with the same sequence-parallel sharding. The
+                shared experts, the dispatch and the experts still use `hidden_states`.
+                Defaults to None, meaning `hidden_states`.
             sequence_ids (torch.Tensor, optional): Global sequence index of every token, int64
                 of shape [seq_length * bsz] in the flattened [seq_length, bsz] order and identical
                 on the TP x CP ranks. Used by the per-sequence seq_aux_loss
@@ -732,6 +741,17 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        if router_input is not None:
+            if router_input.shape[:-1] != hidden_states.shape[:-1]:
+                raise ValueError(
+                    f"router_input of shape {tuple(router_input.shape)} must have the leading "
+                    f"shape of hidden_states {tuple(hidden_states.shape)}."
+                )
+            if self.config.cuda_graph_impl == "transformer_engine" and (
+                CudaGraphModule.moe_router in self.config.cuda_graph_modules
+                or CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
+            ):
+                raise ValueError("router_input is not supported with partial MoE CUDA graphs.")
         # Passed on only when set, so that `route` overrides and routers without per-sequence
         # load balancing keep working.
         sequence_kwargs = {}
@@ -751,12 +771,17 @@ class MoELayer(BaseMoELayer):
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+        def custom_forward(
+            hidden_states, intermediate_tensors=None, padding_mask=None, router_input=None
+        ):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(
-                        hidden_states, padding_mask, input_ids, **sequence_kwargs
+                        hidden_states if router_input is None else router_input,
+                        padding_mask,
+                        input_ids,
+                        **sequence_kwargs,
                     )
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
@@ -796,6 +821,8 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        # router_input is an explicit checkpoint input (never a closure), so that the recomputed
+        # router reads a detached copy and its gradient flows out through the checkpoint.
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
@@ -806,13 +833,21 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,
+                    router_input,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    custom_forward,
+                    False,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                    router_input,
                 )
         else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+            outputs = custom_forward(
+                hidden_states, intermediate_tensors, padding_mask, router_input
+            )
 
         return outputs
 
