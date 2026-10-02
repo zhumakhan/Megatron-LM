@@ -151,6 +151,92 @@ def switch_load_balancing_loss_func(
     return aux_loss
 
 
+def per_sequence_load_balancing_loss_func(
+    probs: torch.Tensor,
+    top_indices: torch.Tensor,
+    sequence_ids: torch.Tensor,
+    num_sequences: int,
+    topk: int,
+    num_experts: int,
+    moe_aux_loss_coeff: float,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Calculate the sequence-level auxiliary loss with every sequence normalized on its own.
+
+    The formula is:
+        loss = coeff / B * Σ_{b=1}^{B} Σ_{e=1}^{E} f_be * P_be
+    where:
+        f_be = E * c_be / (topk * T_b)
+        P_be = 1 / T_b * Σ_{x∈b} probs(x, e)
+        c_be is the number of valid tokens of sequence b whose top-k contains expert e
+        T_b is the number of valid tokens of sequence b (at least 1)
+        B is `num_sequences` and E is the number of experts
+
+    The tokens of a sequence may be spread over the ranks of `reduce_group` (for example the
+    tensor- and context-parallel ranks). c_be, T_b and the probability sums are summed over that
+    group, so every rank returns the loss of the complete sequences while the gradient reaches only
+    its local `probs`. Ranks without tokens must call this function too, because they take part
+    in the reductions. The counts are exact int64 sums; the probability sums use `index_add`,
+    which is deterministic only under `torch.use_deterministic_algorithms(True)`.
+
+    Args:
+        probs (torch.Tensor): Router scores normalized over all experts. Shape
+            [num_tokens, num_experts].
+        top_indices (torch.Tensor): Indices of the experts selected for each token without the
+            expert bias. Shape [num_tokens, topk].
+        sequence_ids (torch.Tensor): Index of the sequence of each token, in
+            [0, num_sequences). Shape [num_tokens]. Must refer to the same sequences on all
+            ranks of `reduce_group`.
+        num_sequences (int): Number of sequences B the loss is averaged over.
+        topk (int): The number of experts selected for each token.
+        num_experts (int): The number of experts.
+        moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
+        reduce_group (torch.distributed.ProcessGroup, optional): Ranks that hold other tokens of
+            the same sequences. Defaults to None, meaning that every sequence is local.
+        padding_mask (torch.Tensor, optional): Boolean mask of shape [num_tokens], True for
+            padding tokens, which are excluded. Defaults to None.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The auxiliary loss, a scalar that is identical on all
+        ranks of `reduce_group`, and the number of valid local tokens as a 0-dim int64 tensor.
+    """
+    num_tokens = probs.shape[0]
+    if num_sequences < 1:
+        raise ValueError(f"num_sequences must be positive, got {num_sequences}.")
+    if top_indices.shape != (num_tokens, topk):
+        raise ValueError(
+            f"Expected top_indices of shape {(num_tokens, topk)}, got {tuple(top_indices.shape)}."
+        )
+    if sequence_ids.numel() != num_tokens:
+        raise ValueError(f"Expected {num_tokens} sequence_ids, got {sequence_ids.numel()}.")
+    sequence_ids = sequence_ids.reshape(-1).long()
+    num_rows = num_sequences
+    if padding_mask is not None:
+        # Padding tokens accumulate into one extra row, which is dropped.
+        sequence_ids = sequence_ids.masked_fill(padding_mask.reshape(-1), num_sequences)
+        num_rows += 1
+
+    with torch.no_grad():
+        counts = torch.zeros(num_rows * num_experts, dtype=torch.int64, device=probs.device)
+        positions = (sequence_ids.unsqueeze(-1) * num_experts + top_indices).reshape(-1)
+        counts.index_add_(0, positions, torch.ones_like(positions))
+        counts = counts.view(num_rows, num_experts)[:num_sequences]
+        # Every valid token selects exactly topk distinct experts.
+        local_num_tokens = counts.sum() // topk
+    probs_sum = probs.new_zeros(num_rows, num_experts).index_add(0, sequence_ids, probs)
+    probs_sum = probs_sum[:num_sequences]
+    if reduce_group is not None and reduce_group.size() > 1:
+        torch.distributed.all_reduce(counts, group=reduce_group)
+        probs_sum = reduce_from_tensor_model_parallel_region(probs_sum, reduce_group)
+
+    num_tokens_per_sequence = (counts.sum(dim=-1) // topk).clamp(min=1).to(probs_sum.dtype)
+    num_tokens_per_sequence = num_tokens_per_sequence.unsqueeze(-1)
+    frequency = num_experts * counts.to(probs_sum.dtype) / (topk * num_tokens_per_sequence)
+    loss = (frequency * (probs_sum / num_tokens_per_sequence)).sum(dim=-1).mean()
+    return loss * moe_aux_loss_coeff, local_num_tokens
+
+
 def z_loss_func(
     logits: torch.Tensor, z_loss_coeff: float, padding_mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -963,6 +1049,29 @@ def topk_routing_with_score_function(
     return routing_probs, routing_map
 
 
+def compute_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    """Apply the score function to the router logits without normalizing over the experts.
+
+    Args:
+        logits: Router logits with experts in the final dimension.
+        score_function: Score function to use. Must be `softmax`, `sigmoid`, or
+            `sqrtsoftplus`. Softmax scores are normalized by construction.
+
+    Returns:
+        Float32 router scores with the same shape as `logits`.
+
+    Raises:
+        ValueError: If `score_function` is unsupported.
+    """
+    if score_function == "softmax":
+        return torch.softmax(logits, dim=-1, dtype=torch.float32)
+    if score_function == "sigmoid":
+        return torch.sigmoid(logits.float())
+    if score_function == "sqrtsoftplus":
+        return torch.nn.functional.softplus(logits.float()).sqrt()
+    raise ValueError(f"Invalid score_function: {score_function}")
+
+
 def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
     """Compute the normalized score distribution over all experts.
 
@@ -977,14 +1086,9 @@ def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) 
     Raises:
         ValueError: If `score_function` is unsupported.
     """
+    scores = compute_router_scores(logits, score_function)
     if score_function == "softmax":
-        return torch.softmax(logits, dim=-1, dtype=torch.float32)
-    if score_function == "sigmoid":
-        scores = torch.sigmoid(logits.float())
-    elif score_function == "sqrtsoftplus":
-        scores = torch.nn.functional.softplus(logits.float()).sqrt()
-    else:
-        raise ValueError(f"Invalid score_function: {score_function}")
+        return scores
     return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
 
 
