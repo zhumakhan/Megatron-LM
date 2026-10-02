@@ -532,3 +532,29 @@ def test_loss_function_checks_the_range_of_sequence_ids():
         for mask in (None, padding_mask):
             with pytest.raises(RuntimeError, match="sequence_ids"):
                 loss(ids, mask)
+
+
+def test_per_sequence_normalization_requires_seq_aux_loss():
+    """'per_sequence' only changes the seq_aux_loss, so it is rejected without that loss."""
+
+    def config(load_balancing_type, coeff):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=8,
+            num_moe_experts=NUM_EXPERTS,
+            moe_router_topk=TOPK,
+            moe_router_load_balancing_type=load_balancing_type,
+            moe_aux_loss_coeff=coeff,
+            moe_seq_aux_loss_normalization="per_sequence",
+        )
+
+    for load_balancing_type, coeff in (
+        ("aux_loss", 0.01),
+        ("none", 0.0),
+        (["aux_loss", "global_aux_loss"], [0.01, 0.01]),
+    ):
+        with pytest.raises(ValueError, match="include 'seq_aux_loss'"):
+            config(load_balancing_type, coeff)
+    config("seq_aux_loss", 0.01)
+    config(["aux_loss", "seq_aux_loss"], [0.01, 0.01])

@@ -271,11 +271,10 @@ class TestRouterNativeFixes:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("load_balancing_type", ["none", "seq_aux_loss"])
     def test_topk_router_on_zero_tokens(self, load_balancing_type):
-        config = _config(
-            moe_router_load_balancing_type=load_balancing_type,
-            moe_aux_loss_coeff=0.0 if load_balancing_type == "none" else 0.01,
-            moe_seq_aux_loss_normalization="per_sequence",
-        )
+        overrides = dict(moe_router_load_balancing_type=load_balancing_type)
+        if load_balancing_type == "seq_aux_loss":
+            overrides.update(moe_aux_loss_coeff=0.01, moe_seq_aux_loss_normalization="per_sequence")
+        config = _config(**overrides)
         router = _router(config)
         hidden = torch.empty(0, 1, HIDDEN, device="cuda", dtype=torch.bfloat16)
         hidden.requires_grad_(True)

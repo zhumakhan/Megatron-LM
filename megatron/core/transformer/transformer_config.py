@@ -991,7 +991,8 @@ class TransformerConfig(ModelParallelConfig):
     P_be sums the scores of b normalized over all experts. Counts, sums and T_b are reduced over
     the tensor- and context-parallel ranks and padding tokens are excluded. The sequences can be
     given explicitly with the `sequence_ids` and `num_sequences` arguments of `MoELayer.forward`
-    (e.g. for packed or compacted router inputs); they default to the batch entries."""
+    (e.g. for packed or compacted router inputs); they default to the batch entries. Requires
+    `moe_router_load_balancing_type` to include "seq_aux_loss"."""
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
@@ -2476,6 +2477,20 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_seq_aux_loss_normalization must be 'batch_mean' or 'per_sequence', "
                 f"got {self.moe_seq_aux_loss_normalization!r}."
+            )
+        load_balancing_types = (
+            self.moe_router_load_balancing_type
+            if isinstance(self.moe_router_load_balancing_type, list)
+            else [self.moe_router_load_balancing_type]
+        )
+        if (
+            self.moe_seq_aux_loss_normalization == "per_sequence"
+            and "seq_aux_loss" not in load_balancing_types
+        ):
+            raise ValueError(
+                "moe_seq_aux_loss_normalization='per_sequence' requires "
+                "moe_router_load_balancing_type to include 'seq_aux_loss', got "
+                f"{self.moe_router_load_balancing_type!r}."
             )
 
         if self.moe_expert_capacity_factor is not None:
