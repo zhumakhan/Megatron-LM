@@ -127,24 +127,30 @@ def check_key_padding_mask(
             batch size, or batch size 1 for one mask shared by every sample.
         key_length (int, optional): number of keys of the attention inputs, which the mask
             must cover.
+
+    Raises:
+        ValueError: if the mask has another layout or dtype, or does not match the inputs.
     """
-    assert (
+    if not (
         attention_mask.dim() == 4
         and attention_mask.shape[1] == 1
         and attention_mask.shape[2] == 1
         and attention_mask.dtype == torch.bool
-    ), (
-        "AttnMaskType.key_padding expects a [b, 1, 1, sk] bool attention mask, got "
-        f"{tuple(attention_mask.shape)} {attention_mask.dtype}"
-    )
-    assert batch_size is None or attention_mask.shape[0] in (1, batch_size), (
-        f"key_padding mask has batch size {attention_mask.shape[0]}, but the attention inputs "
-        f"have batch size {batch_size} (expected {batch_size} or 1)"
-    )
-    assert key_length is None or attention_mask.shape[-1] == key_length, (
-        f"key_padding mask covers {attention_mask.shape[-1]} keys, but the attention inputs "
-        f"have {key_length} keys"
-    )
+    ):
+        raise ValueError(
+            "AttnMaskType.key_padding expects a [b, 1, 1, sk] bool attention mask, got "
+            f"{tuple(attention_mask.shape)} {attention_mask.dtype}"
+        )
+    if batch_size is not None and attention_mask.shape[0] not in (1, batch_size):
+        raise ValueError(
+            f"key_padding mask has batch size {attention_mask.shape[0]}, but the attention "
+            f"inputs have batch size {batch_size} (expected {batch_size} or 1)"
+        )
+    if key_length is not None and attention_mask.shape[-1] != key_length:
+        raise ValueError(
+            f"key_padding mask covers {attention_mask.shape[-1]} keys, but the attention inputs "
+            f"have {key_length} keys"
+        )
 
 
 def check_key_padding_window(sliding_window: bool) -> None:
@@ -316,17 +322,21 @@ def ulysses_inner_config(
     Args:
         config (TransformerConfig): config of the attention layer.
         cp_group (ProcessGroup): the context-parallel group the sequence is sharded over.
+
+    Raises:
+        ValueError: without a context-parallel group, or if the heads or query groups cannot be
+            split across the tensor- and context-parallel ranks.
     """
-    assert (
-        cp_group is not None
-    ), "cp_comm_type='ulysses' needs an initialized context-parallel group"
+    if cp_group is None:
+        raise ValueError("cp_comm_type='ulysses' needs an initialized context-parallel group")
     cp_size = cp_group.size()
     shards = config.tensor_model_parallel_size * cp_size
     for name in ("num_attention_heads", "num_query_groups"):
-        assert getattr(config, name) % shards == 0, (
-            f"cp_comm_type='ulysses' needs {name} ({getattr(config, name)}) to be divisible by "
-            f"tensor_model_parallel_size * context_parallel_size ({shards})"
-        )
+        if getattr(config, name) % shards != 0:
+            raise ValueError(
+                f"cp_comm_type='ulysses' needs {name} ({getattr(config, name)}) to be divisible "
+                f"by tensor_model_parallel_size * context_parallel_size ({shards})"
+            )
     inner = copy.copy(config)
     inner.num_attention_heads //= cp_size
     inner.num_query_groups //= cp_size
@@ -414,7 +424,8 @@ def ulysses_attention(
     def scatter_heads(tensor: torch.Tensor) -> torch.Tensor:
         # [s / cp, b, h, d] -> [s, b, h / cp, d]: gather the sequence, keep 1 / cp of the heads.
         heads, head_dim = tensor.shape[-2:]
-        assert heads % cp_size == 0, f"{heads} heads cannot be split across {cp_size} CP ranks"
+        if heads % cp_size != 0:
+            raise ValueError(f"{heads} heads cannot be split across {cp_size} CP ranks")
         exchanged = all_to_all_sp2hp(tensor.flatten(-2), group=cp_group)
         return exchanged.view(
             tensor.shape[0] * cp_size, *tensor.shape[1:-2], heads // cp_size, head_dim

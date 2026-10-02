@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """recompute_granularity='full' has to checkpoint, and the offload path has to keep the
-per-layer shared inputs (including hash-routing token IDs) resident.
+per-layer shared inputs (including hash-routing token IDs) resident. checkpointed_forward also
+rejects an exit_after_layer outside of the block.
 
 Runs on the CPU with toy layers: torch.utils.checkpoint stands in for
 tensor_parallel.checkpoint, which needs CUDA RNG state.
@@ -88,6 +89,25 @@ def _run(block, input_ids=None):
         out.float().pow(2).sum().backward()
     assert hidden_states.grad is not None
     return len(calls)
+
+
+@pytest.mark.parametrize("layer_offset,exit_after_layer", [(0, -1), (0, 4), (4, 3), (4, 8)])
+def test_rejects_exit_after_layer_outside_the_block(layer_offset, exit_after_layer):
+    block = _block(4, "block", 2)
+    with pytest.raises(ValueError, match="is not a layer of this block"):
+        recompute.checkpointed_forward(
+            block,
+            hidden_states=torch.randn(SEQ, BATCH, HIDDEN, requires_grad=True),
+            attention_mask=None,
+            context=None,
+            context_mask=None,
+            rotary_pos_emb=None,
+            attention_bias=None,
+            packed_seq_params=None,
+            use_inner_quantization_context=False,
+            layer_offset=layer_offset,
+            exit_after_layer=exit_after_layer,
+        )
 
 
 class TestFullRecomputeCheckpoints:

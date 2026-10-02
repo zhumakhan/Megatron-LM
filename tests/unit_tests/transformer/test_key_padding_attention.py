@@ -209,7 +209,7 @@ class TestKeyPaddingAttention:
         inputs = _inputs(2, dtype)
         attention = _te_attention(_config(bf16=dtype == torch.bfloat16, params_dtype=dtype))
         dense = torch.zeros(2, 1, SEQUENCE, SEQUENCE, dtype=torch.bool, device="cuda")
-        with pytest.raises(AssertionError, match=r"\[b, 1, 1, sk\]"):
+        with pytest.raises(ValueError, match=r"\[b, 1, 1, sk\]"):
             attention(*inputs, dense, attn_mask_type=AttnMaskType.key_padding)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -247,10 +247,10 @@ class TestKeyPaddingAttention:
             attention = _te_attention(config)
         inputs = _inputs(4, dtype)
         two_samples = torch.zeros(2, 1, 1, SEQUENCE, dtype=torch.bool, device="cuda")
-        with pytest.raises(AssertionError, match="batch size 2"):
+        with pytest.raises(ValueError, match="batch size 2"):
             attention(*inputs, two_samples, attn_mask_type=AttnMaskType.key_padding)
         short = torch.zeros(4, 1, 1, SEQUENCE - 8, dtype=torch.bool, device="cuda")
-        with pytest.raises(AssertionError, match=f"covers {SEQUENCE - 8} keys"):
+        with pytest.raises(ValueError, match=f"covers {SEQUENCE - 8} keys"):
             attention(*inputs, short, attn_mask_type=AttnMaskType.key_padding)
 
     def test_rejects_sliding_window_attention(self):
@@ -325,7 +325,7 @@ class TestKeyPaddingAttention:
             )
             for name, a, e in zip(("output", "dq", "dk", "dv"), actual, expected):
                 _assert_bitwise(a, e, f"{mask_type} {name}")
-        with pytest.raises(AssertionError, match="attention_mask=None"):
+        with pytest.raises(ValueError, match="attention_mask=None"):
             attention(
                 *inputs,
                 torch.zeros(3, 1, 1, 177, dtype=torch.bool, device="cuda"),

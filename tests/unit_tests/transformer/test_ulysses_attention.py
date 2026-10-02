@@ -2,6 +2,8 @@
 
 """cp_comm_type='ulysses': Megatron-side all-to-all context parallelism around a non-CP kernel."""
 
+import types
+
 import pytest
 import torch
 
@@ -12,7 +14,11 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import clear_key_padding_metadata_cache
+from megatron.core.transformer.utils import (
+    clear_key_padding_metadata_cache,
+    ulysses_attention,
+    ulysses_inner_config,
+)
 from tests.unit_tests.test_utilities import Utils
 
 pytest.importorskip("transformer_engine")
@@ -380,7 +386,7 @@ class TestUlyssesAttention:
             _config(1, 2, cp_comm_type="p2p"), AttnMaskType.key_padding, "p2p"
         )
         inputs, _ = _global_inputs(HEADS)
-        with pytest.raises(AssertionError, match="ulysses"):
+        with pytest.raises(ValueError, match="ulysses"):
             attention(
                 *[_shard(t) for t in inputs],
                 _global_mask("key_padding"),
@@ -396,7 +402,7 @@ class TestUlyssesAttention:
         assert attention.config.num_attention_heads == HEADS // 2
         assert attention.num_attention_heads == HEADS // 2  # TE: global heads of the kernel
         assert config.num_attention_heads == HEADS and config.context_parallel_size == 2
-        with pytest.raises(AssertionError, match="packed"):
+        with pytest.raises(ValueError, match="packed"):
             from megatron.core.packed_seq_params import PackedSeqParams
 
             cu_seqlens = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
@@ -411,3 +417,28 @@ class TestUlyssesAttention:
                     qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens
                 ),
             )
+        # Every input of ulysses_attention needs a number of heads divisible by cp.
+        query = torch.randn(8, 1, 3, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="3 heads cannot be split across 2 CP ranks"):
+            ulysses_attention(
+                attention._forward_local,
+                query,
+                query,
+                query,
+                attention.ulysses_cp_group,
+                None,
+                AttnMaskType.no_mask,
+            )
+
+
+def test_inner_config_validation():
+    """ulysses_inner_config needs a context-parallel group that splits the heads evenly."""
+    config = _config(1, 1)
+    with pytest.raises(ValueError, match="context-parallel group"):
+        ulysses_inner_config(config, None)
+    three_ranks = types.SimpleNamespace(size=lambda: 3)
+    with pytest.raises(ValueError, match="num_attention_heads"):
+        ulysses_inner_config(config, three_ranks)
+    inner = ulysses_inner_config(config, types.SimpleNamespace(size=lambda: 2))
+    assert inner.num_attention_heads == HEADS // 2 and inner.context_parallel_size == 1
+    assert config.num_attention_heads == HEADS

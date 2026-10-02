@@ -182,9 +182,9 @@ def checkpointed_forward(
             Tensors that pytree cannot reach are closed over; a dataclass holding a tensor
             that requires grad raises a ValueError (see TransformerBlock.forward).
         exit_after_layer (int, optional): Global index of the last layer to run. Later layers
-            are skipped. The layer must belong to this pipeline stage. CPU activation
-            offloading is skipped for such a pass, because Transformer Engine's offload context
-            counts layer entries and only starts over after the last layer.
+            are skipped. The layer must belong to this pipeline stage (ValueError otherwise).
+            CPU activation offloading is skipped for such a pass, because Transformer Engine's
+            offload context counts layer entries and only starts over after the last layer.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -196,12 +196,14 @@ def checkpointed_forward(
 
     num_layers = self.num_layers_per_pipeline_rank
     if exit_after_layer is not None:
+        last_layer = layer_offset + self.num_layers_per_pipeline_rank - 1
+        if not layer_offset <= exit_after_layer <= last_layer:
+            raise ValueError(
+                f"exit_after_layer={exit_after_layer} is not a layer of this block, which holds "
+                f"the global layers {layer_offset} to {last_layer}. With pipeline parallelism, "
+                "only the stage that holds the exit layer may receive exit_after_layer."
+            )
         num_layers = exit_after_layer - layer_offset + 1
-        assert 0 < num_layers <= self.num_layers_per_pipeline_rank, (
-            f"exit_after_layer={exit_after_layer} is not a layer of this pipeline stage, which "
-            f"holds global layers {layer_offset} to "
-            f"{layer_offset + self.num_layers_per_pipeline_rank - 1}."
-        )
 
     # Pass the tensors of layer_kwargs to the checkpoints positionally, after the fixed inputs,
     # and rebuild the mapping around them inside the checkpointed function. The closure keeps

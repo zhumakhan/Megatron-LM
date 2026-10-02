@@ -2423,11 +2423,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     ) -> torch.Tensor:
         """Forward."""
         if self.ulysses_cp_group is not None:
-            assert packed_seq_params is None and self.qkv_format == "sbhd", (
-                "cp_comm_type='ulysses' supports sbhd inputs only; packed sequences (THD) "
-                "are not supported."
-            )
-            assert attention_bias is None, "cp_comm_type='ulysses' does not support attention_bias"
+            if packed_seq_params is not None or self.qkv_format != "sbhd":
+                raise ValueError(
+                    "cp_comm_type='ulysses' supports sbhd inputs only; bshd inputs and packed "
+                    "sequences (THD) are not supported."
+                )
+            if attention_bias is not None:
+                raise ValueError("cp_comm_type='ulysses' does not support attention_bias")
             check_ulysses_attn_mask_type(attn_mask_type)
             return ulysses_attention(
                 self._forward_local,
@@ -2528,14 +2530,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             without a valid key are zero.
         """
         assert self.te_forward_mask_type, "AttnMaskType.key_padding requires TE >= 0.12"
-        assert attention_bias is None, "attention_bias is not supported with key_padding masks"
-        assert self.config.context_parallel_size == 1, (
-            "AttnMaskType.key_padding supports context parallelism only through "
-            "cp_comm_type='ulysses'"
-        )
+        if attention_bias is not None:
+            raise ValueError("attention_bias is not supported with key_padding masks")
+        if self.config.context_parallel_size != 1:
+            raise ValueError(
+                "AttnMaskType.key_padding supports context parallelism only through "
+                "cp_comm_type='ulysses'"
+            )
         check_key_padding_window(self.sliding_window_attention)
         sbhd = self.qkv_format == "sbhd"
-        assert sbhd or self.qkv_format == "bshd", f"key_padding: qkv_format {self.qkv_format}"
+        if not sbhd and self.qkv_format != "bshd":
+            raise ValueError(
+                "AttnMaskType.key_padding without packed_seq_params needs sbhd or bshd inputs, "
+                f"got qkv_format {self.qkv_format}"
+            )
         te_kwargs = dict(num_splits=num_splits, bf16_backward=bf16_backward)
         if attention_mask is None:
             return self._forward_te(query, key, value, None, AttnMaskType.no_mask, **te_kwargs)
@@ -2681,10 +2689,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     attn_mask_type = AttnMaskType.padding
                 elif attn_mask_type in (AttnMaskType.key_padding, AttnMaskType.arbitrary):
                     # Sequence boundaries come from cu_seqlens; THD cannot take a dense mask.
-                    assert attention_mask is None, (
-                        f"{attn_mask_type} with THD packed_seq_params expects attention_mask=None "
-                        "(sequence boundaries come from cu_seqlens)"
-                    )
+                    if attention_mask is not None:
+                        raise ValueError(
+                            f"{attn_mask_type} with THD packed_seq_params expects "
+                            "attention_mask=None (sequence boundaries come from cu_seqlens)"
+                        )
                     attn_mask_type = AttnMaskType.padding
             if attn_mask_type == AttnMaskType.key_padding:
                 raise ValueError(
