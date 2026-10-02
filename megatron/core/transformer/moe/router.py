@@ -652,7 +652,8 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Flattened padding mask of shape [num_tokens],
                 True for padding tokens.
             sequence_ids (torch.Tensor, optional): Global sequence index of every token, shape
-                [num_tokens]. Defaults to the batch index of the [seq_length, bsz] layout.
+                [num_tokens], in [0, num_sequences) for valid tokens. Defaults to the batch index
+                of the [seq_length, bsz] layout.
             num_sequences (int, optional): Number of sequences. Required with `sequence_ids`;
                 otherwise it must be None or `bsz`.
         """
@@ -1025,10 +1026,11 @@ class TopKRouter(Router):
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
             sequence_ids (torch.Tensor, optional): Global sequence index of every token, a 1-D
-                int64 tensor of shape [num_tokens] in the flattened [seq_length, bsz] order. A
-                sequence must have the same index on all ranks of the TP x CP group. Used by the
-                per-sequence seq_aux_loss (`moe_seq_aux_loss_normalization='per_sequence'`);
-                defaults to the batch index.
+                int64 tensor of shape [num_tokens] in the flattened [seq_length, bsz] order, in
+                [0, num_sequences) for every valid token (checked on the device). A sequence must
+                have the same index on all ranks of the TP x CP group. Used by the per-sequence
+                seq_aux_loss (`moe_seq_aux_loss_normalization='per_sequence'`); defaults to the
+                batch index.
             num_sequences (int, optional): Global number of sequences that `sequence_ids` refers
                 to. Required with `sequence_ids`.
 

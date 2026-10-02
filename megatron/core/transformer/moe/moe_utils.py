@@ -185,9 +185,12 @@ def per_sequence_load_balancing_loss_func(
             [num_tokens, num_experts].
         top_indices (torch.Tensor): Indices of the experts selected for each token without the
             expert bias. Shape [num_tokens, topk].
-        sequence_ids (torch.Tensor): Index of the sequence of each token, in
-            [0, num_sequences). A 1-D int64 (or int32) tensor of shape [num_tokens], in the token
-            order of `probs`. Must refer to the same sequences on all ranks of `reduce_group`.
+        sequence_ids (torch.Tensor): Index of the sequence of each token, a 1-D int64 (or int32)
+            tensor of shape [num_tokens] in the token order of `probs`. Must refer to the same
+            sequences on all ranks of `reduce_group`. The ids of valid tokens must lie in
+            [0, num_sequences); the ids of padding tokens are not used. The range is checked
+            with an asynchronous device-side assertion (`torch._assert_async`), which needs no
+            host synchronization; on the CPU it raises a RuntimeError.
         num_sequences (int): Number of sequences B the loss is averaged over.
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
@@ -219,11 +222,19 @@ def per_sequence_load_balancing_loss_func(
     if sequence_ids.numel() != num_tokens:
         raise ValueError(f"Expected {num_tokens} sequence_ids, got {sequence_ids.numel()}.")
     sequence_ids = sequence_ids.long()
+    in_range = (sequence_ids >= 0) & (sequence_ids < num_sequences)
     num_rows = num_sequences
     if padding_mask is not None:
+        padding_mask = padding_mask.reshape(-1)
+        in_range = in_range | padding_mask
         # Padding tokens accumulate into one extra row, which is dropped.
-        sequence_ids = sequence_ids.masked_fill(padding_mask.reshape(-1), num_sequences)
+        sequence_ids = sequence_ids.masked_fill(padding_mask, num_sequences)
         num_rows += 1
+    # A valid token with the id num_sequences would be dropped like padding, and other
+    # out-of-range ids would fail inside index_add. Check on the device, without a host sync.
+    torch._assert_async(
+        in_range.all(), "sequence_ids of valid tokens must lie in [0, num_sequences)"
+    )
 
     with torch.no_grad():
         counts = torch.zeros(num_rows * num_experts, dtype=torch.int64, device=probs.device)

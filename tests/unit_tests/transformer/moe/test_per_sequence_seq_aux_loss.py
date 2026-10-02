@@ -503,3 +503,32 @@ def test_loss_function_excludes_padding_and_counts_exactly():
     assert probs.grad[keep].abs().sum() > 0
     assert torch.equal(loss, reference)
     assert torch.equal(probs.grad[keep], reference_probs.grad)
+
+
+def test_loss_function_checks_the_range_of_sequence_ids():
+    """The ids of valid tokens must lie in [0, num_sequences); padding ids are not used.
+
+    The check is an asynchronous device-side assertion, which leaves a CUDA context unusable
+    when it fires, so the out-of-range cases run on the CPU, where it raises a RuntimeError.
+    """
+    generator = torch.Generator().manual_seed(5)
+    probs = torch.rand(6, NUM_EXPERTS, generator=generator)
+    top_indices = torch.rand(6, NUM_EXPERTS, generator=generator).topk(TOPK).indices
+    padding_mask = torch.tensor([False, False, False, False, False, True])
+
+    def loss(ids, mask=None):
+        ids = torch.tensor(ids)
+        value, _ = per_sequence_load_balancing_loss_func(
+            probs, top_indices, ids, 3, TOPK, NUM_EXPERTS, 1.0, padding_mask=mask
+        )
+        return value
+
+    expected = loss([0, 1, 2, 2, 1, 0], padding_mask)
+    for padding_id in (-1, 3, 99):
+        assert torch.equal(loss([0, 1, 2, 2, 1, padding_id], padding_mask), expected)
+    # With a padding mask, a valid token with the id num_sequences (3) would otherwise be
+    # dropped like padding without an error.
+    for ids in ([0, 1, 3, 2, 1, 0], [0, -1, 2, 2, 1, 0]):
+        for mask in (None, padding_mask):
+            with pytest.raises(RuntimeError, match="sequence_ids"):
+                loss(ids, mask)
