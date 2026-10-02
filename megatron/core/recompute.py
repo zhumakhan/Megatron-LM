@@ -174,13 +174,20 @@ def checkpointed_forward(
                 self.config.cpu_offloading_num_layers,
                 self.config.cpu_offloading_prefetch_num_layers,
             )
-        # Masks, rotary embeddings and the cross-attention context are shared by every
-        # layer, but the checkpoint saves them per layer. Keep them resident rather than
-        # copying them to the CPU once per layer.
+        # Masks, rotary embeddings, token IDs and the cross-attention context are shared by
+        # every layer, but the checkpoint saves them per layer. Keep them resident rather
+        # than copying them to the CPU once per layer.
         if te_mark_not_offload is not None:
             shared = [
                 t
-                for t in (attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+                for t in (
+                    attention_mask,
+                    context,
+                    context_mask,
+                    *rotary_pos_emb,
+                    padding_mask,
+                    input_ids,
+                )
                 if isinstance(t, Tensor)
             ]
             if shared:
@@ -293,13 +300,13 @@ def checkpointed_forward(
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (
-          hidden_states, 
-          attention_mask, 
-          context, 
-          context_mask, 
-          *rotary_pos_emb, 
-          padding_mask,
-          input_ids,
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            *rotary_pos_emb,
+            padding_mask,
+            input_ids,
         )
         if (
             offload_scheduler is not None
@@ -320,7 +327,9 @@ def checkpointed_forward(
                         *args,
                     )
                 else:
-                    hidden_states, context = cf(*args)
+                    hidden_states, context = tensor_parallel.checkpoint(
+                        cf, self.config.distribute_saved_activations, *args
+                    )
             else:
                 # Note: original block-branch no-checkpoint path omitted padding_mask
                 # (relied on its default=None); restored here for consistency.
