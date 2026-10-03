@@ -211,6 +211,22 @@ class TestKeyPaddingAttention:
         with pytest.raises(ValueError, match=r"\[b, 1, 1, sk\]"):
             attention(*inputs, dense, attn_mask_type=AttnMaskType.key_padding)
 
+    def test_rejects_attention_bias(self):
+        mask = _mask()
+        inputs = _inputs(mask.shape[0], torch.bfloat16)
+        attention = _te_attention(_config())
+        bias = torch.zeros(1, HEADS, SEQUENCE, SEQUENCE, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="attention_bias is not supported with key_padding"):
+            attention(*inputs, mask, attn_mask_type=AttnMaskType.key_padding, attention_bias=bias)
+
+    def test_rejects_thd_format_without_packed_seq_params(self):
+        """Without packed_seq_params, key_padding needs sbhd or bshd inputs."""
+        attention = _te_attention(_config())
+        attention.qkv_format = "thd"
+        inputs = [t[:, 0] for t in _inputs(1, torch.bfloat16)]
+        with pytest.raises(ValueError, match="needs sbhd or bshd inputs, got qkv_format thd"):
+            attention(*inputs, _mask()[1:2], attn_mask_type=AttnMaskType.key_padding)
+
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     def test_shared_mask_matches_per_sample_masks(self, dtype, monkeypatch):
         """A [1, 1, 1, sk] mask applies to every sample, exactly like its [b, 1, 1, sk] copy."""

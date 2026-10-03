@@ -415,6 +415,13 @@ class TestUlyssesAttention:
                     qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens
                 ),
             )
+        # The all-to-alls exchange only q/k/v, so an attention_bias is rejected.
+        query = torch.randn(8, 1, HEADS // 2, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        bias = torch.zeros(1, HEADS // 2, 16, 16, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="does not support attention_bias"):
+            attention(
+                query, query, query, None, attn_mask_type=AttnMaskType.no_mask, attention_bias=bias
+            )
         # Every input of ulysses_attention needs a number of heads divisible by cp.
         query = torch.randn(8, 1, 3, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
         with pytest.raises(ValueError, match="3 heads cannot be split across 2 CP ranks"):
