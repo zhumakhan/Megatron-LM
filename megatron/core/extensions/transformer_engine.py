@@ -54,9 +54,18 @@ from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    check_key_padding_mask,
+    check_key_padding_window,
+    check_ulysses_attention_type,
+    check_ulysses_attn_mask_type,
     ensure_metadata_has_dp_cp_group,
+    get_key_padding_metadata,
     is_layer_window_attention,
+    key_padding_pack,
+    key_padding_safe_mask,
     make_sharded_tensors_for_checkpoint,
+    ulysses_attention,
+    ulysses_inner_config,
 )
 from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
@@ -2160,6 +2169,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     Note that if Megatron's parallel_state has not been initialized yet, the
     tp_group and cp_group passed to TE will be None and must be set later
     via set_tensor_parallel_group() and set_context_parallel_group().
+
+    AttnMaskType.key_padding (sbhd or bshd inputs): the ``[b, 1, 1, sk]`` key mask (or one
+    ``[1, 1, 1, sk]`` mask for every sample) becomes a THD varlen call that keeps every query
+    and compacts keys/values to their valid positions; samples without a valid key give zero
+    output rows. The varlen metadata is cached per mask (see
+    :func:`megatron.core.transformer.utils.get_key_padding_metadata` for the cache contract).
+    Inputs that TE's fused and flash backends cannot run (e.g. fp32) use the dense mask on the
+    unfused backend instead. Layers with sliding window attention do not support key_padding.
+    With THD packed_seq_params, key_padding and arbitrary map to TE's ``padding``.
+
+    cp_comm_type='ulysses': see TransformerConfig.cp_comm_type. The TE kernel is built without
+    context parallelism for ``1 / cp`` of the heads, and forward exchanges q/k/v and the output
+    with all-to-alls over the context-parallel group. Cross-attention and causal mask types are
+    rejected.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2183,6 +2206,25 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
+
+        # Megatron-side Ulysses: the TE kernel runs without CP on the full sequence and on
+        # 1 / cp of the heads; forward() performs the all-to-alls.
+        self.ulysses_cp_group = None
+        if config.context_parallel_size > 1 and cp_comm_type == "ulysses":
+            check_ulysses_attention_type(attention_type)
+            check_ulysses_attn_mask_type(attn_mask_type)
+            self.ulysses_cp_group = (
+                getattr(pg_collection, "cp", None)
+                if pg_collection is not None
+                else get_context_parallel_group(check_initialized=False)
+            )
+            config = ulysses_inner_config(config, self.ulysses_cp_group)
+
+        self.sliding_window_attention = is_layer_window_attention(
+            config.window_size, config.window_attn_skip_freq, layer_number
+        )
+        if attn_mask_type == AttnMaskType.key_padding:
+            check_key_padding_window(self.sliding_window_attention)
 
         self.config = config
         self.te_forward_mask_type = False
@@ -2275,9 +2317,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     f"Currently set to: {os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', 'not set')}."
                 )
 
-        if is_layer_window_attention(
-            config.window_size, config.window_attn_skip_freq, layer_number
-        ):
+        if self.sliding_window_attention:
             # Check version
             assert is_te_min_version("1.2.0"), (
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
@@ -2347,6 +2387,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             extra_kwargs["return_max_logit"] = True
             self.current_max_attn_logits = None
 
+        # TE has no key_padding mask type; forward() always passes the per-call TE mask type,
+        # so the constructor only needs a type TE accepts.
+        if attn_mask_type == AttnMaskType.key_padding:
+            attn_mask_type = AttnMaskType.arbitrary
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,
@@ -2377,6 +2422,198 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        if self.ulysses_cp_group is not None:
+            if packed_seq_params is not None or self.qkv_format != "sbhd":
+                raise ValueError(
+                    "cp_comm_type='ulysses' supports sbhd inputs only; bshd inputs and packed "
+                    "sequences (THD) are not supported."
+                )
+            if attention_bias is not None:
+                raise ValueError("cp_comm_type='ulysses' does not support attention_bias")
+            check_ulysses_attn_mask_type(attn_mask_type)
+            return ulysses_attention(
+                self._forward_local,
+                query,
+                key,
+                value,
+                self.ulysses_cp_group,
+                attention_mask,
+                attn_mask_type,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            )
+        return self._forward_local(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            num_splits=num_splits,
+            bf16_backward=bf16_backward,
+        )
+
+    def _forward_local(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Attention over the sequence held by this rank (no Megatron-side CP exchange)."""
+        if attn_mask_type == AttnMaskType.key_padding and packed_seq_params is None:
+            return self._forward_key_padding(
+                query,
+                key,
+                value,
+                attention_mask,
+                attention_bias=attention_bias,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            )
+        return self._forward_te(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            num_splits=num_splits,
+            bf16_backward=bf16_backward,
+        )
+
+    @contextmanager
+    def _te_attention_type(self, attention_type: str):
+        """Temporarily run TE with ``attention_type`` (its sub-backends cache the value too)."""
+        modules = [self] + [
+            getattr(self, name)
+            for name in ("flash_attention", "fused_attention", "unfused_attention")
+            if hasattr(getattr(self, name, None), "attention_type")
+        ]
+        previous = [module.attention_type for module in modules]
+        for module in modules:
+            module.attention_type = attention_type
+        try:
+            yield
+        finally:
+            for module, value in zip(modules, previous):
+                module.attention_type = value
+
+    def _forward_key_padding(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attention_bias: Optional[Tensor] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Attention with an AttnMaskType.key_padding mask on sbhd or bshd inputs.
+
+        Args:
+            query, key, value (Tensor): ``[sq, b, np, hn]``, ``[sk, b, ng, hn]`` (sbhd) or
+                ``[b, sq, np, hn]``, ``[b, sk, ng, hn]`` (bshd).
+            attention_mask (Tensor): ``[b, 1, 1, sk]`` bool, True = ignore that key, or
+                ``[1, 1, 1, sk]`` for one mask shared by every sample. Masked keys may sit
+                anywhere in the sequence; queries are never masked.
+
+        Returns:
+            Tensor: ``[sq, b, np * hn]`` (sbhd) or ``[b, sq, np * hn]`` (bshd); rows of samples
+            without a valid key are zero.
+        """
+        assert self.te_forward_mask_type, "AttnMaskType.key_padding requires TE >= 0.12"
+        if attention_bias is not None:
+            raise ValueError("attention_bias is not supported with key_padding masks")
+        if self.config.context_parallel_size != 1:
+            raise ValueError(
+                "AttnMaskType.key_padding supports context parallelism only through "
+                "cp_comm_type='ulysses'"
+            )
+        check_key_padding_window(self.sliding_window_attention)
+        sbhd = self.qkv_format == "sbhd"
+        if not sbhd and self.qkv_format != "bshd":
+            raise ValueError(
+                "AttnMaskType.key_padding without packed_seq_params needs sbhd or bshd inputs, "
+                f"got qkv_format {self.qkv_format}"
+            )
+        te_kwargs = dict(num_splits=num_splits, bf16_backward=bf16_backward)
+        if attention_mask is None:
+            return self._forward_te(query, key, value, None, AttnMaskType.no_mask, **te_kwargs)
+        batch = query.shape[1] if sbhd else query.shape[0]
+        check_key_padding_mask(attention_mask, batch, key.shape[0] if sbhd else key.shape[1])
+        if attention_mask.shape[0] != batch:
+            # One mask for every sample: the varlen layout needs one row per sample. The
+            # expanded view shares the mask storage, so its metadata is cached like the mask's.
+            attention_mask = attention_mask.expand(batch, -1, -1, -1)
+
+        def zero_empty_samples(output: Tensor, empty: Tensor) -> Tensor:
+            # empty: [b, 1, 1, 1] -> [1, b, 1] (sbhd) or [b, 1, 1] (bshd) over the output.
+            return output.masked_fill(empty[:, 0].transpose(0, 1) if sbhd else empty[:, 0], 0)
+
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            # TE's fused and flash backends need fp16/bf16, so run the dense mask on the unfused
+            # backend. A row whose keys are all masked has no softmax: attend to key 0 and zero
+            # the row afterwards.
+            safe_mask, empty = key_padding_safe_mask(attention_mask)
+            output = self._forward_te(
+                query, key, value, safe_mask, AttnMaskType.arbitrary, **te_kwargs
+            )
+            return zero_empty_samples(output, empty)
+
+        # THD varlen call: every query is kept (cu_seqlens_q = arange(b + 1) * sq) and the keys
+        # and values of each sample are compacted to its valid positions. The metadata needs one
+        # host sync per mask and is shared by all layers and the activation recompute.
+        if sbhd:
+            length, _, heads, head_dim = query.shape
+            query = query.transpose(0, 1)
+        else:
+            _, length, heads, head_dim = query.shape
+        metadata = get_key_padding_metadata(attention_mask, length)
+        kv_index = metadata.sbhd_kv_index if sbhd else metadata.bshd_kv_index
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_kv=metadata.cu_seqlens_kv,
+            max_seqlen_q=length,
+            max_seqlen_kv=attention_mask.shape[-1],
+        )
+        # Queries and keys have different lengths, which TE handles as cross attention.
+        with self._te_attention_type("cross"):
+            output = self._forward_te(
+                query.reshape(-1, heads, head_dim).contiguous(),
+                key_padding_pack(key, kv_index),
+                key_padding_pack(value, kv_index),
+                None,
+                AttnMaskType.padding,
+                packed_seq_params=packed_seq_params,
+                **te_kwargs,
+            )
+        output = output.reshape(batch, length, -1)
+        if sbhd:
+            output = output.transpose(0, 1)
+        return zero_empty_samples(output, metadata.empty)
+
+    def _forward_te(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Call TE's DotProductAttention."""
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
@@ -2450,6 +2687,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     attn_mask_type = AttnMaskType.padding_causal
                 elif attn_mask_type == AttnMaskType.no_mask:
                     attn_mask_type = AttnMaskType.padding
+                elif attn_mask_type in (AttnMaskType.key_padding, AttnMaskType.arbitrary):
+                    # Sequence boundaries come from cu_seqlens; THD cannot take a dense mask.
+                    if attention_mask is not None:
+                        raise ValueError(
+                            f"{attn_mask_type} with THD packed_seq_params expects "
+                            "attention_mask=None (sequence boundaries come from cu_seqlens)"
+                        )
+                    attn_mask_type = AttnMaskType.padding
+            if attn_mask_type == AttnMaskType.key_padding:
+                raise ValueError(
+                    "AttnMaskType.key_padding needs sbhd inputs without packed_seq_params, or "
+                    f"THD packed_seq_params (got qkv_format={qkv_format})"
+                )
             _fa_kwargs = dict(
                 attn_mask_type=attn_mask_type.name, **attention_bias_kwargs, **packed_seq_kwargs
             )
@@ -2484,6 +2734,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     )
 
         else:
+            assert (
+                attn_mask_type != AttnMaskType.key_padding
+            ), "AttnMaskType.key_padding requires TE >= 0.12"
             _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits

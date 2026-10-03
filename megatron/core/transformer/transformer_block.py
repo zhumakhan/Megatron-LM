@@ -3,7 +3,8 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Set, Union, cast
+from itertools import islice
+from typing import Any, Dict, List, Optional, Set, Union, cast
 
 import torch
 from torch import Tensor
@@ -72,6 +73,28 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+# Keyword arguments TransformerBlock itself passes to its layers. The extra ``layer_kwargs`` of
+# TransformerBlock.forward must not repeat them.
+_BLOCK_LAYER_CALL_KWARGS = frozenset(
+    (
+        "hidden_states",
+        "attention_mask",
+        "context",
+        "context_mask",
+        "rotary_pos_emb",
+        "rotary_pos_cos",
+        "rotary_pos_sin",
+        "rotary_pos_cos_sin",
+        "attention_bias",
+        "inference_context",
+        "packed_seq_params",
+        "sequence_len_offset",
+        "padding_mask",
+        "mhc_recompute_manager",
+    )
+)
 
 
 def get_num_layers_to_build(
@@ -554,6 +577,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        layer_kwargs: Optional[Dict[str, Any]] = None,
+        exit_after_layer: Optional[int] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -590,6 +615,42 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
+            layer_kwargs (Dict[str, Any], optional): Extra keyword arguments passed to every
+                layer call of this block, e.g. conditioning tensors shared by all layers. The
+                caller must make sure the layers accept them; the stock TransformerLayer does
+                not, so this is meant for custom layer classes. These should subclass
+                BaseTransformerLayer: under full activation recompute, a layer that does not is
+                called like a MambaLayer and gets no context, context_mask, attention_bias or
+                padding_mask. The keys must not repeat the keyword arguments the block passes
+                itself (hidden_states, attention_mask, context, ...). Under full activation
+                recompute the mapping is flattened with ``torch.utils._pytree``, every value
+                that holds no tensor counting as a leaf. Its tensor leaves become explicit
+                inputs of every activation checkpoint, so they are saved and restored like the
+                hidden states, receive gradients, and stay on the GPU when the recompute path
+                offloads activations to the CPU. The dicts, lists and tuples around them are
+                rebuilt for every chunk of layers the block runs, so in-place changes to those
+                do not reach the caller. All other values (numbers, objects that pytree does
+                not flatten, containers without tensors such as an empty list that collects
+                per-layer statistics) are passed by identity; a checkpointed layer runs twice,
+                without gradients in the forward pass and again in the backward pass, so such
+                side channels see both calls. Tensors that pytree cannot reach, e.g. inside an
+                unregistered dataclass, are closed over, which suits tensors without gradients
+                such as masks. A closed-over tensor that requires grad would be backpropagated
+                into from inside each checkpoint that reads it, which breaks backward for a
+                non-leaf tensor read by several checkpoints. Pass such tensors directly or
+                inside dicts, lists or tuples, or register their container with
+                ``torch.utils._pytree.register_dataclass``; a dataclass holding such a tensor
+                raises a ValueError.
+            exit_after_layer (int, optional): Global layer index (0-based across all pipeline
+                stages, like extract_layer_indices) after which the block stops. Later layers
+                do not run and the final layernorm (and the mHC output contraction) is skipped,
+                so the block returns that layer's raw output, i.e. the tensor that
+                extract_layer_indices would collect for it; extract_layer_indices is still
+                handled as usual for the layers that run. The layer must belong to this block,
+                so with pipeline parallelism only the stage that holds it may receive the flag.
+                CPU activation offloading is skipped for such a pass, because Transformer
+                Engine's offload context counts layer entries and only starts over after the
+                last layer.
 
         Returns:
             Union[Tensor, Tuple[Tensor, List[Tensor]]]:
@@ -617,6 +678,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         layer_offset = get_transformer_layer_offset(
             self.config, self.vp_stage, get_pg_rank(pp_group)
+        )
+
+        layer_kwargs = self._check_layer_kwargs(layer_kwargs)
+        num_layers_to_run = self._num_layers_to_run(
+            exit_after_layer, layer_offset, extract_layer_indices
+        )
+        # Transformer Engine's CPU offload context counts layer entries and starts over only
+        # after the last layer, so a pass that exits early must not enter it.
+        offload_context = self.offload_context if exit_after_layer is None else nullcontext()
+        offload_commit = (
+            self.group_prefetch_offload_commit_async if exit_after_layer is None else None
         )
 
         # Delete the obsolete reference to the initial input tensor if necessary
@@ -692,7 +764,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 "intermediate layer can reach discarded activations before they are restored."
             )
         mhc_layer_managers, mhc_is_last_in_recompute_block = build_mhc_recompute_layer_plan(
-            num_layers=len(self.layers),
+            num_layers=num_layers_to_run,
             mhc_recompute_layer_num=self.config.mhc_recompute_layer_num,
             use_mhc_recompute=use_mhc_recompute,
         )
@@ -713,6 +785,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    layer_kwargs=layer_kwargs,
+                    exit_after_layer=exit_after_layer,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -722,7 +796,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
-                for l_no, layer in enumerate(self.layers):
+                for l_no, layer in enumerate(islice(self.layers, num_layers_to_run)):
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -752,7 +826,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     extra_layer_kwargs = (
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
-                    with self.offload_context, inner_quantization_context:
+                    with offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -768,6 +842,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
+                            **layer_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
@@ -779,22 +854,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (
                         torch.is_grad_enabled()
                         and self.config.cpu_offloading
-                        and self.group_prefetch_offload_commit_async is not None
+                        and offload_commit is not None
                     ):
-                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+                        hidden_states = offload_commit(hidden_states)
 
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
+        # An early exit returns the raw output of its layer.
+        exited_early = exit_after_layer is not None
+
         # Only contract if the final layer norm is in this stage
-        if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
+        if (
+            self.config.enable_mhc_connections
+            and self.has_final_layernorm_in_this_stage()
+            and not exited_early
+        ):
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
-        if self.final_layernorm is not None:
+        if self.final_layernorm is not None and not exited_early:
             hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
@@ -812,6 +894,39 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return hidden_states, intermediate_hidden_states
 
         return hidden_states
+
+    @staticmethod
+    def _check_layer_kwargs(layer_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Return the extra layer keyword arguments of forward() as a new dict."""
+        layer_kwargs = dict(layer_kwargs or {})
+        reserved = sorted(_BLOCK_LAYER_CALL_KWARGS.intersection(layer_kwargs))
+        if reserved:
+            raise ValueError(
+                f"layer_kwargs must not contain {reserved}: TransformerBlock passes these "
+                "keyword arguments to its layers itself."
+            )
+        return layer_kwargs
+
+    def _num_layers_to_run(
+        self, exit_after_layer: Optional[int], layer_offset: int, extract_layer_indices: Set[int]
+    ) -> int:
+        """Return how many of this block's layers forward() runs, given exit_after_layer."""
+        if exit_after_layer is None:
+            return len(self.layers)
+        last_layer = layer_offset + len(self.layers) - 1
+        if not layer_offset <= exit_after_layer <= last_layer:
+            raise ValueError(
+                f"exit_after_layer={exit_after_layer} is not a layer of this block, which holds "
+                f"the global layers {layer_offset} to {last_layer}. With pipeline parallelism, "
+                "only the stage that holds the exit layer may receive exit_after_layer."
+            )
+        skipped = sorted(index for index in extract_layer_indices if index > exit_after_layer)
+        if skipped:
+            raise ValueError(
+                f"extract_layer_indices {skipped} lie after exit_after_layer={exit_after_layer}, "
+                "so those layers do not run."
+            )
+        return exit_after_layer - layer_offset + 1
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

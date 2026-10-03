@@ -2,18 +2,22 @@
 
 """Utilities for transformer layers."""
 
+import copy
 import gc
 import logging
 import os
+from collections import OrderedDict
+from dataclasses import dataclass
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.utils import (
     get_pg_rank,
     get_tensor_model_parallel_group_if_none,
@@ -110,6 +114,328 @@ def get_sliding_window_causal_mask(sq, skv, window_size):
 def attention_mask_func(attention_scores, attention_mask):
     attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
+
+
+def check_key_padding_mask(
+    attention_mask: torch.Tensor, batch_size: Optional[int] = None, key_length: Optional[int] = None
+) -> None:
+    """Check that ``attention_mask`` is a ``[b, 1, 1, sk]`` boolean key-padding mask.
+
+    Args:
+        attention_mask (Tensor): the mask, True = ignore that key.
+        batch_size (int, optional): batch size of the attention inputs. The mask must have this
+            batch size, or batch size 1 for one mask shared by every sample.
+        key_length (int, optional): number of keys of the attention inputs, which the mask
+            must cover.
+
+    Raises:
+        ValueError: if the mask has another layout or dtype, or does not match the inputs.
+    """
+    if not (
+        attention_mask.dim() == 4
+        and attention_mask.shape[1] == 1
+        and attention_mask.shape[2] == 1
+        and attention_mask.dtype == torch.bool
+    ):
+        raise ValueError(
+            "AttnMaskType.key_padding expects a [b, 1, 1, sk] bool attention mask, got "
+            f"{tuple(attention_mask.shape)} {attention_mask.dtype}"
+        )
+    if batch_size is not None and attention_mask.shape[0] not in (1, batch_size):
+        raise ValueError(
+            f"key_padding mask has batch size {attention_mask.shape[0]}, but the attention "
+            f"inputs have batch size {batch_size} (expected {batch_size} or 1)"
+        )
+    if key_length is not None and attention_mask.shape[-1] != key_length:
+        raise ValueError(
+            f"key_padding mask covers {attention_mask.shape[-1]} keys, but the attention inputs "
+            f"have {key_length} keys"
+        )
+
+
+def check_key_padding_window(sliding_window: bool) -> None:
+    """Reject AttnMaskType.key_padding on a layer with sliding window attention.
+
+    Args:
+        sliding_window (bool): whether the layer applies sliding window attention.
+    """
+    if sliding_window:
+        raise ValueError(
+            "AttnMaskType.key_padding does not support sliding window attention (window_size): "
+            "the varlen kernel would apply the window to compacted key positions. Use "
+            "AttnMaskType.arbitrary with a dense mask on windowed layers."
+        )
+
+
+def key_padding_safe_mask(attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Make every row of a key-padding mask attend to at least one key.
+
+    Args:
+        attention_mask (Tensor): ``[b, 1, 1, sk]`` boolean key-padding mask, True = ignore key.
+
+    Returns:
+        Tuple of the mask with key 0 unmasked for samples without any valid key, and the
+        ``[b, 1, 1, 1]`` boolean flags of those samples. Their attention output must be zeroed
+        by the caller.
+    """
+    empty = attention_mask.all(dim=-1, keepdim=True)
+    first = torch.arange(attention_mask.shape[-1], device=attention_mask.device) == 0
+    return attention_mask & ~(empty & first), empty
+
+
+@dataclass(frozen=True)
+class KeyPaddingMetadata:
+    """Varlen (THD) layout of a ``[b, 1, 1, sk]`` key-padding mask.
+
+    Every query is kept and the keys/values of each sample are compacted to its valid positions.
+    Samples without any valid key keep key 0 (see :func:`key_padding_safe_mask`); their output
+    rows must be zeroed with :attr:`empty`.
+    """
+
+    sbhd_kv_index: torch.Tensor
+    """int64 ``[nnz]``: kept rows of the ``[sk * b, ...]`` view of an ``[sk, b, ...]`` key or
+    value tensor, in sample-major (THD) order."""
+
+    bshd_kv_index: torch.Tensor
+    """int64 ``[nnz]``: kept rows of the ``[b * sk, ...]`` view of a ``[b, sk, ...]`` key or
+    value tensor, in sample-major (THD) order."""
+
+    cu_seqlens_q: torch.Tensor
+    """int32 ``[b + 1]``: cumulative query lengths, ``arange(b + 1) * sq``."""
+
+    cu_seqlens_kv: torch.Tensor
+    """int32 ``[b + 1]``: cumulative numbers of kept keys."""
+
+    empty: torch.Tensor
+    """bool ``[b, 1, 1, 1]``: samples without any valid key."""
+
+
+_KEY_PADDING_METADATA_CACHE_SIZE = 8
+_key_padding_metadata_cache: "OrderedDict[tuple, Tuple[torch.Tensor, KeyPaddingMetadata]]" = (
+    OrderedDict()
+)
+
+
+def clear_key_padding_metadata_cache() -> None:
+    """Drop all cached key-padding metadata and the masks the cache keeps alive.
+
+    Call it after writing a cached mask in a way that does not bump its version counter (see
+    :func:`get_key_padding_metadata`), e.g. once per step when a persistent mask buffer is
+    refilled by a collective.
+    """
+    _key_padding_metadata_cache.clear()
+
+
+def _build_key_padding_metadata(
+    attention_mask: torch.Tensor, query_length: int
+) -> KeyPaddingMetadata:
+    batch, key_length = attention_mask.shape[0], attention_mask.shape[-1]
+    safe_mask, empty = key_padding_safe_mask(attention_mask)
+    valid = ~safe_mask[:, 0, 0]
+    lengths = valid.sum(dim=-1, dtype=torch.int32)
+    cu_seqlens_kv = torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))
+    cu_seqlens_q = (
+        torch.arange(batch + 1, device=attention_mask.device, dtype=torch.int32) * query_length
+    )
+    # The only host synchronization: nonzero() needs the number of kept keys.
+    bshd_kv_index = valid.reshape(-1).nonzero().squeeze(1)
+    sbhd_kv_index = (bshd_kv_index % key_length) * batch + torch.div(
+        bshd_kv_index, key_length, rounding_mode="floor"
+    )
+    return KeyPaddingMetadata(
+        sbhd_kv_index=sbhd_kv_index,
+        bshd_kv_index=bshd_kv_index,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        empty=empty,
+    )
+
+
+def get_key_padding_metadata(attention_mask: torch.Tensor, query_length: int) -> KeyPaddingMetadata:
+    """Return the varlen (THD) metadata of a key-padding mask, computed once per mask.
+
+    The metadata is cached on the mask storage (data pointer, version counter, shape, strides,
+    device), so every layer that receives the same mask, and the activation-checkpoint
+    recompute (which receives detached aliases of the same storage), reuse a single
+    ``nonzero`` and its device-to-host synchronization. A cached mask is kept alive, so its
+    storage cannot be reused by another tensor while the entry exists.
+
+    Like autograd's checks of saved tensors, the cache relies on the mask's version counter:
+    in-place PyTorch operations on the mask (or on a view of it) bump the version and
+    invalidate the entry, but writes that bypass the version counter go unnoticed and would
+    return stale metadata. Such writes include ``torch.distributed`` collectives into an
+    existing mask buffer (``broadcast``, ``all_gather_into_tensor``, ...), custom CUDA or
+    Triton kernels, and writes through ``.data`` or ``untyped_storage()``. After such a write,
+    call ``torch.autograd.graph.increment_version(mask)`` or
+    :func:`clear_key_padding_metadata_cache`, or pass a new mask tensor instead.
+
+    Masks that are inference tensors, and calls under ``torch.inference_mode()``, bypass the
+    cache: inference tensors have no version counter, and metadata built in inference mode
+    could not be saved for backward by a later training forward.
+
+    Args:
+        attention_mask (Tensor): ``[b, 1, 1, sk]`` boolean mask, True = ignore that key.
+        query_length (int): number of queries per sample.
+    """
+    check_key_padding_mask(attention_mask)
+    if attention_mask.is_inference() or torch.is_inference_mode_enabled():
+        return _build_key_padding_metadata(attention_mask, query_length)
+    key = (
+        attention_mask.data_ptr(),
+        attention_mask._version,
+        tuple(attention_mask.shape),
+        attention_mask.stride(),
+        attention_mask.device,
+        query_length,
+    )
+    entry = _key_padding_metadata_cache.get(key)
+    if entry is not None:
+        _key_padding_metadata_cache.move_to_end(key)
+        return entry[1]
+    metadata = _build_key_padding_metadata(attention_mask, query_length)
+    _key_padding_metadata_cache[key] = (attention_mask.detach(), metadata)
+    while len(_key_padding_metadata_cache) > _KEY_PADDING_METADATA_CACHE_SIZE:
+        _key_padding_metadata_cache.popitem(last=False)
+    return metadata
+
+
+def key_padding_pack(tensor: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
+    """Gather the kept rows of an sbhd or bshd key or value tensor into THD ``[nnz, h, d]``.
+
+    Args:
+        tensor (Tensor): key or value tensor, ``[sk, b, h, d]`` or ``[b, sk, h, d]``.
+        kv_index (Tensor): the matching :attr:`KeyPaddingMetadata.sbhd_kv_index` or
+            :attr:`KeyPaddingMetadata.bshd_kv_index` of the key-padding mask.
+    """
+    return tensor.reshape(-1, *tensor.shape[2:]).index_select(0, kv_index)
+
+
+def ulysses_inner_config(
+    config: 'TransformerConfig', cp_group: torch.distributed.ProcessGroup
+) -> 'TransformerConfig':
+    """Config of the attention kernel that runs inside ``cp_comm_type='ulysses'``.
+
+    The kernel sees the full sequence and ``1 / cp`` of the (tensor-parallel local) heads, so it
+    is built with ``num_attention_heads`` and ``num_query_groups`` divided by the context-parallel
+    size and with context parallelism disabled.
+
+    Args:
+        config (TransformerConfig): config of the attention layer.
+        cp_group (ProcessGroup): the context-parallel group the sequence is sharded over.
+
+    Raises:
+        ValueError: without a context-parallel group, or if the heads or query groups cannot be
+            split across the tensor- and context-parallel ranks.
+    """
+    if cp_group is None:
+        raise ValueError("cp_comm_type='ulysses' needs an initialized context-parallel group")
+    cp_size = cp_group.size()
+    shards = config.tensor_model_parallel_size * cp_size
+    for name in ("num_attention_heads", "num_query_groups"):
+        if getattr(config, name) % shards != 0:
+            raise ValueError(
+                f"cp_comm_type='ulysses' needs {name} ({getattr(config, name)}) to be divisible "
+                f"by tensor_model_parallel_size * context_parallel_size ({shards})"
+            )
+    inner = copy.copy(config)
+    inner.num_attention_heads //= cp_size
+    inner.num_query_groups //= cp_size
+    inner.context_parallel_size = 1
+    return inner
+
+
+def check_ulysses_attn_mask_type(attn_mask_type: AttnMaskType) -> None:
+    """Reject the mask types that ``cp_comm_type='ulysses'`` does not support.
+
+    Ulysses needs the sequence sharded contiguously across the context-parallel group.
+    Megatron's own context-parallel data and RoPE sharding is load-balanced (zig-zag) for
+    causal attention, and a causal mask over a gathered zig-zag sequence silently gives wrong
+    attention, so causal mask types are rejected.
+
+    Args:
+        attn_mask_type (AttnMaskType): mask type of the attention call.
+    """
+    if attn_mask_type in (
+        AttnMaskType.causal,
+        AttnMaskType.padding_causal,
+        AttnMaskType.causal_bottom_right,
+    ):
+        raise ValueError(
+            f"cp_comm_type='ulysses' does not support {attn_mask_type}: it needs contiguous "
+            "context-parallel sequence shards, while Megatron's context-parallel data and RoPE "
+            "sharding for causal attention is load-balanced (zig-zag). Use cp_comm_type 'p2p', "
+            "'all_gather' or 'a2a' for causal attention."
+        )
+
+
+def check_ulysses_attention_type(attention_type: str) -> None:
+    """Reject the attention types that ``cp_comm_type='ulysses'`` does not support.
+
+    Ulysses exchanges keys and values over the context-parallel group exactly like the queries,
+    so they must be sharded along the sequence like the queries, which holds for self-attention
+    only. The keys and values of cross-attention come from a context that is not sharded that way
+    (the keys and values of a replicated context would be duplicated ``cp`` times, and masks
+    sized to the context would not match).
+
+    Args:
+        attention_type (str): attention type of the layer, "self" or "cross".
+    """
+    if attention_type != "self":
+        raise ValueError(
+            "cp_comm_type='ulysses' supports self-attention only, got "
+            f"attention_type={attention_type!r}: it gathers the keys and values over the "
+            "context-parallel group like the queries, so they must be sharded along the sequence "
+            "like the queries."
+        )
+
+
+def ulysses_attention(
+    attention_fn: Callable[..., torch.Tensor],
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    *args: Any,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """Run ``attention_fn`` on the full sequence with heads split across the CP group (Ulysses).
+
+    Contract: the sequence dimension (dim 0) of ``query``/``key``/``value`` is sharded
+    contiguously across ``cp_group``: with ``s`` the length of the full sequence and ``cp`` the
+    size of ``cp_group``, rank ``r`` holds positions ``[r * s / cp, (r + 1) * s / cp)``. Every
+    tensor argument of ``attention_fn`` that covers the sequence, such as the attention mask, is
+    CP-global.
+
+    Args:
+        attention_fn (Callable): attention kernel called as
+            ``attention_fn(query, key, value, *args, **kwargs)`` on ``[s, b, h / cp, d]`` inputs;
+            it returns ``[s, b, h / cp * d]``.
+        query, key, value (Tensor): ``[s / cp, b, h, d]`` local sequence shards. The number of
+            heads ``h`` may differ between the query and the key/value (grouped-query attention)
+            and must be divisible by ``cp``.
+        cp_group (ProcessGroup): context-parallel group.
+
+    Returns:
+        Tensor: ``[s / cp, b, h * d]`` attention output of the local sequence shard.
+    """
+
+    cp_size = cp_group.size()
+
+    def scatter_heads(tensor: torch.Tensor) -> torch.Tensor:
+        # [s / cp, b, h, d] -> [s, b, h / cp, d]: gather the sequence, keep 1 / cp of the heads.
+        heads, head_dim = tensor.shape[-2:]
+        if heads % cp_size != 0:
+            raise ValueError(f"{heads} heads cannot be split across {cp_size} CP ranks")
+        exchanged = all_to_all_sp2hp(tensor.flatten(-2), group=cp_group)
+        return exchanged.view(
+            tensor.shape[0] * cp_size, *tensor.shape[1:-2], heads // cp_size, head_dim
+        )
+
+    output = attention_fn(
+        scatter_heads(query), scatter_heads(key), scatter_heads(value), *args, **kwargs
+    )
+    # [s, b, h / cp * d] -> [s / cp, b, h * d]
+    return all_to_all_hp2sp(output, group=cp_group).view(*query.shape[:-2], -1)
 
 
 @jit_fuser

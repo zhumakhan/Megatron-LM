@@ -17,8 +17,14 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     attention_mask_func,
+    check_key_padding_mask,
+    check_key_padding_window,
+    check_ulysses_attention_type,
+    check_ulysses_attn_mask_type,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
+    ulysses_attention,
+    ulysses_inner_config,
 )
 from megatron.core.utils import divide
 
@@ -37,6 +43,12 @@ class DotProductAttention(MegatronModule):
      p: number of tensor model parallel partitions
      b: batch size
      s: sequence length
+
+    AttnMaskType.key_padding masks (``[b, 1, 1, sk]``, or ``[1, 1, 1, sk]`` for every sample) are
+    broadcast over the queries like an arbitrary mask, and the output rows of samples without a
+    valid key are zeroed; layers with sliding window attention do not support them. Context
+    parallelism is supported with cp_comm_type='ulysses' only (see
+    TransformerConfig.cp_comm_type), which rejects cross-attention and causal mask types.
     """
 
     def __init__(
@@ -52,11 +64,24 @@ class DotProductAttention(MegatronModule):
     ):
         super().__init__(config=config)
 
+        # Megatron-side Ulysses: attend over the full sequence with 1 / cp of the heads.
+        self.ulysses_cp_group = None
+        if config.context_parallel_size > 1 and cp_comm_type == "ulysses":
+            check_ulysses_attention_type(attention_type)
+            check_ulysses_attn_mask_type(attn_mask_type)
+            self.ulysses_cp_group = (
+                pg_collection.cp
+                if getattr(pg_collection, "cp", None) is not None
+                else parallel_state.get_context_parallel_group()
+            )
+            config = ulysses_inner_config(config, self.ulysses_cp_group)
+
         self.config: TransformerConfig = config
 
-        assert (
-            self.config.context_parallel_size == 1
-        ), "Context parallelism is only supported by TEDotProductAttention!"
+        assert self.config.context_parallel_size == 1, (
+            "Context parallelism is only supported by TEDotProductAttention, or with "
+            "cp_comm_type='ulysses'!"
+        )
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -104,6 +129,8 @@ class DotProductAttention(MegatronModule):
             window_size = self.config.window_size
         else:
             window_size = None
+        if attn_mask_type == AttnMaskType.key_padding:
+            check_key_padding_window(window_size is not None)
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
@@ -158,11 +185,59 @@ class DotProductAttention(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Forward."""
+        if self.ulysses_cp_group is not None:
+            check_ulysses_attn_mask_type(
+                self.attn_mask_type if attn_mask_type is None else attn_mask_type
+            )
+            return ulysses_attention(
+                self._forward_local,
+                query,
+                key,
+                value,
+                self.ulysses_cp_group,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+        return self._forward_local(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def _forward_local(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: Optional[AttnMaskType] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Attention over the sequence held by this rank."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
         )
         assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
+
+        empty_samples = None
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+        if attn_mask_type == AttnMaskType.key_padding:
+            check_key_padding_window(self.scale_mask_softmax.window_size is not None)
+        if attn_mask_type == AttnMaskType.key_padding and attention_mask is not None:
+            # A [b, 1, 1, sk] key mask: broadcast it over the queries (the fused softmax kernel
+            # reads a dense [b, 1, sq, sk] mask) and zero the rows of samples without valid keys.
+            check_key_padding_mask(attention_mask, query.size(1), key.size(0))
+            empty_samples = attention_mask.all(dim=-1).view(1, -1, 1)
+            attention_mask = attention_mask.expand(-1, -1, query.size(0), -1).contiguous()
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
@@ -172,8 +247,6 @@ class DotProductAttention(MegatronModule):
         # This is a noop for normal attention where ng == np. When using group query attention this
         # creates a view that has the keys and values virtually repeated along their dimension to
         # match the number of queries.
-
-        # attn_mask_type is not used.
         if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
             key = key.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
@@ -221,6 +294,8 @@ class DotProductAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
+        # The fused softmax applies self.attn_mask_type; the attn_mask_type argument only selects
+        # the key_padding handling above.
         attention_probs: Tensor = self.scale_mask_softmax(
             attention_scores, attention_mask, self.softmax_offset
         )
@@ -261,6 +336,9 @@ class DotProductAttention(MegatronModule):
         # [sq, b, np, hn] --> [sq, b, hp]
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.view(*new_context_shape)
+
+        if empty_samples is not None:
+            context = context.masked_fill(empty_samples, 0)
 
         return context
 

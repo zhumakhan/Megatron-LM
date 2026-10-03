@@ -388,10 +388,12 @@ def _update_router_expert_bias(
 ):
     """
     Update the expert bias of the router for a global batch.
-    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
+    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks.
+    Routers with a `last_global_tokens_per_expert` buffer receive the all-reduced counts.
     """
     tokens_per_expert_list = []
     expert_bias_list = []
+    global_tokens_per_expert_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             # Only update expert_bias if this module is in the training mode. There are special
@@ -406,11 +408,15 @@ def _update_router_expert_bias(
             ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
+                global_tokens_per_expert_list.append(
+                    getattr(module, 'last_global_tokens_per_expert', None)
+                )
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
+    # All-reduces stacked_tokens_per_expert in place.
     stacked_updated_expert_bias = get_updated_expert_bias(
         stacked_tokens_per_expert,
         stacked_expert_bias,
@@ -420,6 +426,12 @@ def _update_router_expert_bias(
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
+    # Keep the global counts for load-balance metrics; the local counters are reset afterwards.
+    for global_tokens_per_expert, tokens_per_expert in zip(
+        global_tokens_per_expert_list, stacked_tokens_per_expert
+    ):
+        if global_tokens_per_expert is not None:
+            global_tokens_per_expert.copy_(tokens_per_expert)
 
 
 def _update_router_qb_beta(

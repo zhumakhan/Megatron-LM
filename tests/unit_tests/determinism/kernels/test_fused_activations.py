@@ -54,6 +54,16 @@ def _weights(rows):
 GATED_CASES = {
     "bias_swiglu": lambda: (bias_swiglu_impl, (_act((TOKENS, 2 * FFN)), _act((2 * FFN,)))),
     "swiglu_no_bias": lambda: (bias_swiglu_impl, (_act((TOKENS, 2 * FFN)), None)),
+    # [s, b, h] inputs, including a rank without tokens.
+    "bias_swiglu_3d": lambda: (
+        bias_swiglu_impl,
+        (_act((TOKENS // 4, 4, 2 * FFN)), _act((2 * FFN,))),
+    ),
+    "swiglu_3d_no_tokens": lambda: (bias_swiglu_impl, (_act((0, 1, 2 * FFN)), None)),
+    "weighted_swiglu_3d_no_tokens": lambda: (
+        weighted_bias_swiglu_impl,
+        (_act((0, 1, 2 * FFN)), None, _weights(0)),
+    ),
     "clamped_swiglu": lambda: (
         lambda x, b: bias_swiglu_impl(x, b, clamp_value=7.0),
         (_act((TOKENS, 2 * FFN)), _act((2 * FFN,))),
@@ -142,6 +152,19 @@ def test_attention_output_gate_replays_bit_exactly():
         (x, gate),
         replays=3,
         what="attention output gate",
+    )
+
+
+def test_attention_output_gate_in_input_dtype_replays_bit_exactly():
+    """``attention_output_gate_in_fp32=False``: the eager bf16 gate; ``self`` is unused."""
+    seeded()
+    x = _act((2048, 4, 4096))
+    gate = _act((2048, 4, 4096))
+    assert_replays_bit_exact(
+        lambda x, gate: Attention._apply_output_gate_in_input_dtype(None, x, gate),
+        (x, gate),
+        replays=3,
+        what="attention output gate (input dtype)",
     )
 
 

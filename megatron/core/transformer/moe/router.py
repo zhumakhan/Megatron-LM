@@ -22,8 +22,10 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_normalized_router_scores,
+    compute_router_scores,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
+    per_sequence_load_balancing_loss_func,
     qb_dual_update,
     router_gating_linear,
     sinkhorn,
@@ -104,6 +106,11 @@ class Router(ABC, MegatronModule):
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
 
+        An input whose dtype differs from the router weight (e.g. an fp32 router input with bf16
+        weights, or a bf16 input reaching fp32 weights) is first cast to the weight dtype, because
+        the gating GEMM does not accept mixed operand dtypes. With ``moe_router_dtype='fp64'`` both
+        operands are converted to fp64 and the input is left unchanged.
+
         Args:
             input (torch.Tensor): Input tensor.
 
@@ -115,6 +122,9 @@ class Router(ABC, MegatronModule):
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
+        if input.dtype != self.weight.dtype and self.config.moe_router_dtype != 'fp64':
+            input = input.to(self.weight.dtype)
 
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
@@ -221,9 +231,21 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
+            # Token counts of the last global batch, reduced over TPxCPxDP. Written by
+            # finalize_model_grads when it updates the expert bias, for load-balance metrics.
+            self.register_buffer(
+                'last_global_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
+            self.last_global_tokens_per_expert = None
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -324,6 +346,7 @@ class TopKRouter(Router):
         self.enable_expert_bias = False
         self.local_tokens_per_expert = None
         self.expert_bias = None
+        self.last_global_tokens_per_expert = None
 
     def _maintain_float32_expert_bias(self):
         """
@@ -342,6 +365,17 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+
+    def _apply(self, fn, recurse=True):
+        """Apply `fn` to the parameters and buffers, then keep the routing biases in fp32.
+
+        Module dtype casts (e.g. `.to(torch.bfloat16)` or Float16Module) would otherwise leave the
+        biases in low precision until the next forward pass, so that values written into them
+        before that (e.g. when copying weights into a teacher model) would be rounded.
+        """
+        super()._apply(fn, recurse)
+        self._maintain_float32_expert_bias()
+        return self
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -521,17 +555,38 @@ class TopKRouter(Router):
         seq_length: int,
         bsz: int,
         with_padding_mask: bool = False,
+        *,
+        logits: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        sequence_ids: Optional[torch.Tensor] = None,
+        num_sequences: Optional[int] = None,
     ):
         """Apply the sequence-level auxiliary loss for the given scores and routing map.
 
-        To calculate the sequence-level aux loss, we reshape the batch_size dimension to
-        experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
+        With `moe_seq_aux_loss_normalization='batch_mean'`, we reshape the batch_size dimension
+        to experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
         to the sum of aux loss for each sequence in the batch. And then we divide the aux
         loss by the batch size to get averaged aux loss.
+
+        With 'per_sequence', see `_apply_per_sequence_seq_aux_loss`, which uses `logits`,
+        `padding_mask`, `sequence_ids` and `num_sequences`.
         """
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
         if seq_aux_loss_coeff == 0:
             return probs
+
+        if self.config.moe_seq_aux_loss_normalization == "per_sequence":
+            assert logits is not None, "The per-sequence seq_aux_loss requires the router logits."
+            return self._apply_per_sequence_seq_aux_loss(
+                probs,
+                scores_for_aux_loss,
+                logits,
+                bsz,
+                seq_aux_loss_coeff,
+                padding_mask=padding_mask,
+                sequence_ids=sequence_ids,
+                num_sequences=num_sequences,
+            )
 
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
         routing_map = routing_map.reshape(seq_length, -1)
@@ -569,6 +624,75 @@ class TopKRouter(Router):
             valid_token_count=local_num_tokens * bsz,
         )
         return probs
+
+    def _apply_per_sequence_seq_aux_loss(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        logits: torch.Tensor,
+        bsz: int,
+        seq_aux_loss_coeff: float,
+        padding_mask: Optional[torch.Tensor] = None,
+        sequence_ids: Optional[torch.Tensor] = None,
+        num_sequences: Optional[int] = None,
+    ):
+        """Apply the sequence-level auxiliary loss with every sequence normalized on its own.
+
+        Each sequence is normalized by its own number of valid tokens, and the expert counts come
+        from the top-k of the raw (not normalized over the experts) scores without the expert bias.
+        See `per_sequence_load_balancing_loss_func`.
+
+        Args:
+            probs (torch.Tensor): Routing probabilities to attach the loss to.
+            scores_for_aux_loss (torch.Tensor): Scores normalized over all experts,
+                shape [num_tokens, num_experts].
+            logits (torch.Tensor): Router logits, shape [num_tokens, num_experts].
+            bsz (int): Batch size of the [seq_length, bsz] router input.
+            seq_aux_loss_coeff (float): Coefficient of the loss.
+            padding_mask (torch.Tensor, optional): Flattened padding mask of shape [num_tokens],
+                True for padding tokens.
+            sequence_ids (torch.Tensor, optional): Global sequence index of every token, shape
+                [num_tokens], in [0, num_sequences) for valid tokens. Defaults to the batch index
+                of the [seq_length, bsz] layout.
+            num_sequences (int, optional): Number of sequences. Required with `sequence_ids`;
+                otherwise it must be None or `bsz`.
+        """
+        if sequence_ids is None:
+            if num_sequences is not None and num_sequences != bsz:
+                raise ValueError(
+                    f"num_sequences={num_sequences} without sequence_ids must match the batch "
+                    f"size {bsz} of the router input."
+                )
+            # Tokens are flattened from [seq_length, bsz], so token i belongs to sequence i % bsz.
+            sequence_ids = torch.arange(logits.shape[0], device=logits.device) % bsz
+            num_sequences = bsz
+        elif num_sequences is None:
+            raise ValueError("num_sequences is required when sequence_ids is given.")
+
+        with torch.no_grad():
+            scores = compute_router_scores(logits, self.score_function)
+            top_indices = torch.topk(scores, k=self.topk, dim=-1).indices
+        aux_loss, local_num_tokens = per_sequence_load_balancing_loss_func(
+            probs=scores_for_aux_loss,
+            top_indices=top_indices,
+            sequence_ids=sequence_ids,
+            num_sequences=num_sequences,
+            topk=self.topk,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=seq_aux_loss_coeff,
+            reduce_group=self.tp_cp_group,
+            padding_mask=padding_mask,
+        )
+        # The loss is already summed over the TP x CP group, so the metrics tracker must not sum
+        # it again.
+        return self.attach_and_log_load_balancing_loss(
+            probs,
+            seq_aux_loss_coeff,
+            aux_loss,
+            "seq_load_balancing_loss",
+            reduce_group=None,
+            valid_token_count=local_num_tokens,
+        )
 
     def _apply_global_aux_loss(
         self,
@@ -622,7 +746,7 @@ class TopKRouter(Router):
         aux_loss_coeff: float,
         aux_loss: torch.Tensor,
         aux_loss_name: str,
-        reduce_group: torch.distributed.ProcessGroup,
+        reduce_group: Optional[torch.distributed.ProcessGroup],
         needs_dp_avg: bool = True,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
     ):
@@ -633,7 +757,8 @@ class TopKRouter(Router):
             aux_loss_coeff (float): Coefficient for the aux loss.
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
-            reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
+            reduce_group (torch.distributed.ProcessGroup, optional): Process group over which the
+                logged value is summed. None if the loss is already reduced.
             needs_dp_avg (bool): Whether to average this metric across DP ranks after reduce_group.
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
@@ -889,6 +1014,8 @@ class TopKRouter(Router):
         logits: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        sequence_ids: Optional[torch.Tensor] = None,
+        num_sequences: Optional[int] = None,
     ):
         """Top-k routing function
 
@@ -898,6 +1025,14 @@ class TopKRouter(Router):
                 `True` marks padding. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
+            sequence_ids (torch.Tensor, optional): Global sequence index of every token, a 1-D
+                int64 tensor of shape [num_tokens] in the flattened [seq_length, bsz] order, in
+                [0, num_sequences) for every valid token (checked on the device). A sequence must
+                have the same index on all ranks of the TP x CP group. Used by the per-sequence
+                seq_aux_loss (`moe_seq_aux_loss_normalization='per_sequence'`); defaults to the
+                batch index.
+            num_sequences (int, optional): Global number of sequences that `sequence_ids` refers
+                to. Required with `sequence_ids`.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -1027,6 +1162,10 @@ class TopKRouter(Router):
                     seq_length,
                     bsz,
                     with_padding_mask=padding_mask is not None,
+                    logits=logits,
+                    padding_mask=padding_mask,
+                    sequence_ids=sequence_ids,
+                    num_sequences=num_sequences,
                 )
                 probs = self._apply_global_aux_loss(
                     probs,
@@ -1051,6 +1190,8 @@ class TopKRouter(Router):
         input: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        sequence_ids: Optional[torch.Tensor] = None,
+        num_sequences: Optional[int] = None,
     ):
         """
         Forward pass of the router.
@@ -1066,6 +1207,11 @@ class TopKRouter(Router):
                 `True` marks padding. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
+            sequence_ids (torch.Tensor, optional): Global sequence index of every token for the
+                per-sequence seq_aux_loss. See `routing`. Passed on to `routing` only when it or
+                `num_sequences` is set, so that `routing` overrides without these arguments keep
+                working.
+            num_sequences (int, optional): Global number of sequences. See `routing`.
         """
         self._maintain_float32_expert_bias()
 
@@ -1114,7 +1260,12 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask, input_ids=input_ids)
+        sequence_kwargs = {}
+        if sequence_ids is not None or num_sequences is not None:
+            sequence_kwargs = dict(sequence_ids=sequence_ids, num_sequences=num_sequences)
+        probs, routing_map = self.routing(
+            logits, padding_mask=padding_mask, input_ids=input_ids, **sequence_kwargs
+        )
 
         return probs, routing_map
 
@@ -1256,6 +1407,8 @@ class InferenceTopKRouter(TopKRouter):
         input: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        sequence_ids: Optional[torch.Tensor] = None,
+        num_sequences: Optional[int] = None,
     ):
         """Simplified forward pass for inference - returns dense tensors only.
 
@@ -1263,6 +1416,10 @@ class InferenceTopKRouter(TopKRouter):
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
             input_ids (torch.Tensor, optional): Token IDs used by hash routing.
+            sequence_ids (torch.Tensor, optional): Passed to `TopKRouter.forward` outside of
+                inference; not used in inference.
+            num_sequences (int, optional): Passed to `TopKRouter.forward` outside of inference;
+                not used in inference.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -1271,6 +1428,6 @@ class InferenceTopKRouter(TopKRouter):
         """
 
         if not InferenceMode.is_active():
-            return super().forward(input, padding_mask, input_ids)
+            return super().forward(input, padding_mask, input_ids, sequence_ids, num_sequences)
 
         return self._forward(input, padding_mask, input_ids)

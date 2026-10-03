@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import dataclasses
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import Tensor
+from torch.utils._pytree import tree_flatten, tree_leaves, tree_unflatten
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel import ContextParallelLayoutState
@@ -15,7 +17,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -109,6 +111,35 @@ class CheckpointOffloadScheduler:
             self.controller.release_activation_forward_gpu_memory(self._pending_release.pop(0))
 
 
+def _holds_no_tensor(value: Any) -> bool:
+    """Whether ``torch.utils._pytree`` finds no tensor in ``value``."""
+    return not any(isinstance(leaf, Tensor) for leaf in tree_leaves(value))
+
+
+def _check_no_closed_over_grad_tensors(layer_kwargs: Dict[str, Any]) -> None:
+    """Reject dataclasses in ``layer_kwargs`` that hold tensors which require gradients.
+
+    pytree does not flatten a dataclass unless it is registered, so the tensors of such a
+    dataclass are not checkpoint inputs: the checkpointed function closes over them. The
+    re-entrant recompute would then backpropagate into such a tensor from inside every
+    checkpoint that reads it, which fails for a non-leaf tensor read by several checkpoints.
+    """
+    for value in tree_leaves(layer_kwargs):
+        if not dataclasses.is_dataclass(value) or isinstance(value, type):
+            continue
+        for field in dataclasses.fields(value):
+            field_leaves = tree_leaves(getattr(value, field.name, None))
+            if any(isinstance(leaf, Tensor) and leaf.requires_grad for leaf in field_leaves):
+                raise ValueError(
+                    f"layer_kwargs holds a {type(value).__name__} whose field '{field.name}' "
+                    "holds a tensor that requires grad. Under full activation recompute only "
+                    "tensors that torch.utils._pytree can reach are checkpoint inputs and get "
+                    "gradients correctly. Register the dataclass with "
+                    "torch.utils._pytree.register_dataclass, or pass the tensor in layer_kwargs "
+                    "directly or inside a dict, list or tuple."
+                )
+
+
 def checkpointed_forward(
     self: MegatronModule,
     hidden_states: Tensor,
@@ -125,6 +156,9 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    *,
+    layer_kwargs: Optional[Dict[str, Any]] = None,
+    exit_after_layer: Optional[int] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -138,6 +172,19 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        layer_kwargs (Dict[str, Any], optional): Extra keyword arguments for every layer call.
+            The mapping is flattened with ``torch.utils._pytree``, treating every value that
+            holds no tensor as a leaf. Its tensor leaves become explicit inputs of every
+            activation checkpoint, so they are saved and restored like the chunk input and
+            receive gradients. The containers around them are rebuilt for every chunk call, so
+            in-place changes to them do not reach the caller. Every other value is passed by
+            identity; a checkpointed layer runs twice, so a mutable one sees both calls.
+            Tensors that pytree cannot reach are closed over; a dataclass holding a tensor
+            that requires grad raises a ValueError (see TransformerBlock.forward).
+        exit_after_layer (int, optional): Global index of the last layer to run. Later layers
+            are skipped. The layer must belong to this pipeline stage (ValueError otherwise).
+            CPU activation offloading is skipped for such a pass, because Transformer Engine's
+            offload context counts layer entries and only starts over after the last layer.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -146,6 +193,41 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+
+    num_layers = self.num_layers_per_pipeline_rank
+    if exit_after_layer is not None:
+        last_layer = layer_offset + self.num_layers_per_pipeline_rank - 1
+        if not layer_offset <= exit_after_layer <= last_layer:
+            raise ValueError(
+                f"exit_after_layer={exit_after_layer} is not a layer of this block, which holds "
+                f"the global layers {layer_offset} to {last_layer}. With pipeline parallelism, "
+                "only the stage that holds the exit layer may receive exit_after_layer."
+            )
+        num_layers = exit_after_layer - layer_offset + 1
+
+    # Pass the tensors of layer_kwargs to the checkpoints positionally, after the fixed inputs,
+    # and rebuild the mapping around them inside the checkpointed function. The closure keeps
+    # only the non-tensor leaves; the checkpoint saves the tensors. Values without tensors are
+    # leaves, so that the layers get the caller's objects, e.g. lists that collect statistics.
+    layer_kwargs = layer_kwargs or {}
+    if torch.is_grad_enabled():
+        _check_no_closed_over_grad_tensors(layer_kwargs)
+    layer_kwargs_leaves, layer_kwargs_spec = tree_flatten(layer_kwargs, is_leaf=_holds_no_tensor)
+    layer_kwargs_tensor_positions = [
+        position for position, leaf in enumerate(layer_kwargs_leaves) if isinstance(leaf, Tensor)
+    ]
+    layer_kwargs_tensors = [
+        layer_kwargs_leaves[position] for position in layer_kwargs_tensor_positions
+    ]
+    for position in layer_kwargs_tensor_positions:
+        layer_kwargs_leaves[position] = None
+
+    def build_layer_kwargs(tensors: Tuple[Tensor, ...]) -> Dict[str, Any]:
+        """Rebuild layer_kwargs around the tensors the checkpointed function received."""
+        leaves = list(layer_kwargs_leaves)
+        for position, tensor in zip(layer_kwargs_tensor_positions, tensors, strict=True):
+            leaves[position] = tensor
+        return tree_unflatten(leaves, layer_kwargs_spec)
 
     # Wrap non-dual RoPE to tuple to unify custom_forward interface.
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
@@ -157,7 +239,10 @@ def checkpointed_forward(
     # ``save_for_backward`` inside CheckpointFunction, i.e. the chunk input.
     offload_commit = getattr(self, "group_prefetch_offload_commit_async", None)
     offload_enabled = (
-        torch.is_grad_enabled() and self.config.cpu_offloading and offload_commit is not None
+        torch.is_grad_enabled()
+        and self.config.cpu_offloading
+        and offload_commit is not None
+        and exit_after_layer is None
     )
     offload_context = self.offload_context if offload_enabled else nullcontext()
     offload_scheduler: Optional[CheckpointOffloadScheduler] = None
@@ -174,9 +259,9 @@ def checkpointed_forward(
                 self.config.cpu_offloading_num_layers,
                 self.config.cpu_offloading_prefetch_num_layers,
             )
-        # Masks, rotary embeddings, token IDs and the cross-attention context are shared by
-        # every layer, but the checkpoint saves them per layer. Keep them resident rather
-        # than copying them to the CPU once per layer.
+        # Masks, rotary embeddings, token IDs, the cross-attention context and the tensors of
+        # layer_kwargs are shared by every layer, but the checkpoint saves them per layer. Keep
+        # them resident rather than copying them to the CPU once per layer.
         if te_mark_not_offload is not None:
             shared = [
                 t
@@ -187,6 +272,7 @@ def checkpointed_forward(
                     *rotary_pos_emb,
                     padding_mask,
                     input_ids,
+                    *layer_kwargs_tensors,
                 )
                 if isinstance(t, Tensor)
             ]
@@ -203,12 +289,14 @@ def checkpointed_forward(
             rotary_pos_emb_global,
             padding_mask=None,
             input_ids=None,
+            *layer_kwargs_inputs,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
                 if is_dual_rope
                 else rotary_pos_emb_global
             )
+            extra_layer_kwargs = build_layer_kwargs(layer_kwargs_inputs)
 
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
@@ -238,10 +326,12 @@ def checkpointed_forward(
                 else:
                     inner_quantization_context = nullcontext()
 
-                # Build the full TransformerLayer kwarg set; for non-TL
-                # layers (currently MambaLayer in HybridStack) pop the kwargs
-                # they don't accept and treat the return as a single tensor.
-                layer_kwargs = dict(
+                # Build the full TransformerLayer kwarg set. TransformerLayer-like layers
+                # (BaseTransformerLayer, e.g. custom layers in a TransformerBlock) get all of
+                # it, as in TransformerBlock's layer loop; for the other layers (currently
+                # MambaLayer in HybridStack) pop the kwargs they don't accept and treat the
+                # return as a single tensor.
+                call_kwargs = dict(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     context=context,
@@ -255,16 +345,16 @@ def checkpointed_forward(
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
-                    layer_kwargs["input_ids"] = input_ids
+                    call_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, context = layer(**layer_kwargs)
+                    if isinstance(layer, BaseTransformerLayer):
+                        hidden_states, context = layer(**call_kwargs, **extra_layer_kwargs)
                     elif isinstance(getattr(layer, "inner_layer", None), TransformerLayer):
                         # Hybrid mHC wrappers accept the TransformerLayer execution inputs,
                         # including hash-routing token IDs, but not cross-attention-only kwargs.
                         for k in ("context", "context_mask", "attention_bias"):
-                            layer_kwargs.pop(k, None)
-                        hidden_states, context = layer(**layer_kwargs)
+                            call_kwargs.pop(k, None)
+                        hidden_states, context = layer(**call_kwargs, **extra_layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (
                             "context",
@@ -273,16 +363,14 @@ def checkpointed_forward(
                             "padding_mask",
                             "input_ids",
                         ):
-                            layer_kwargs.pop(k, None)
+                            call_kwargs.pop(k, None)
                         if (
                             packed_sequence_cp_metadata is not None
                             and type(layer.config) is MambaLayerConfig
                             and layer.config.linear_cp_mode == "chunkwise"
                         ):
-                            layer_kwargs["packed_sequence_cp_metadata"] = (
-                                packed_sequence_cp_metadata
-                            )
-                        hidden_states = layer(**layer_kwargs)
+                            call_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+                        hidden_states = layer(**call_kwargs, **extra_layer_kwargs)
                         context = None
 
                 # Some layer paths may still return a tuple (defensive).
@@ -307,6 +395,7 @@ def checkpointed_forward(
             *rotary_pos_emb,
             padding_mask,
             input_ids,
+            *layer_kwargs_tensors,
         )
         if (
             offload_scheduler is not None
@@ -352,10 +441,8 @@ def checkpointed_forward(
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
         layer_idx = 0
-        while layer_idx < self.num_layers_per_pipeline_rank:
-            chunk_end = min(
-                layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
-            )
+        while layer_idx < num_layers:
+            chunk_end = min(layer_idx + self.config.recompute_num_layers, num_layers)
             chunk_runner(layer_idx, chunk_end, True)
             layer_idx += self.config.recompute_num_layers
     elif self.config.recompute_method == 'block':
@@ -365,7 +452,7 @@ def checkpointed_forward(
         # FP8/FP4 we skip checkpointing while hidden_states.requires_grad
         # is False (these slots get pushed past the recompute window).
         recompute_skip_num_layers = 0
-        for layer_idx in range(self.num_layers_per_pipeline_rank):
+        for layer_idx in range(num_layers):
             if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
                 recompute_skip_num_layers += 1
             use_checkpoint = (

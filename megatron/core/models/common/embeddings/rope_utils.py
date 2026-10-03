@@ -328,6 +328,12 @@ def apply_rotary_pos_emb(
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
+
+    With ``config.rope_freqs_per_token`` and ``cu_seqlens`` given, ``freqs`` holds one row per
+    packed token (``[t, 1, 1, d]``, row i rotates token i): positions do not restart per sequence
+    and the THD tensor is rotated as a ``[t, 1, h, d]`` sbhd view (fused or unfused, as for
+    sbhd inputs). Requires context parallel size 1 and at least ``t`` rows of ``freqs``
+    (ValueError otherwise).
     """
     global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
 
@@ -336,6 +342,27 @@ def apply_rotary_pos_emb(
         cp_group = parallel_state.get_context_parallel_group()
     if mla_rotary_interleaved is None:
         mla_rotary_interleaved = config.multi_latent_attention
+
+    if cu_seqlens is not None and getattr(config, "rope_freqs_per_token", False):
+        if cp_group.size() != 1:
+            raise ValueError("rope_freqs_per_token requires context parallel size 1")
+        if freqs.size(0) < t.size(0):
+            raise ValueError(
+                f"rope_freqs_per_token expects one frequency row per token: got {freqs.size(0)} "
+                f"rows for {t.size(0)} tokens"
+            )
+        if freqs.size(0) != t.size(0):
+            freqs = freqs[: t.size(0)]
+        return apply_rotary_pos_emb(
+            t.unsqueeze(1),
+            freqs,
+            config=config,
+            mscale=mscale,
+            cp_group=cp_group,
+            mla_rotary_interleaved=mla_rotary_interleaved,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
+        ).squeeze(1)
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:

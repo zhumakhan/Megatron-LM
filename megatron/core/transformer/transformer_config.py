@@ -274,6 +274,13 @@ class TransformerConfig(ModelParallelConfig):
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
 
+    rope_freqs_per_token: bool = False
+    """If True, the rotary frequencies passed with THD packed sequences hold one row per packed
+    token (``[t, 1, 1, d]``, row i rotates token i, e.g. precomputed multi-axis coordinates), so
+    positions do not restart at each sequence start. The THD tensor is then rotated as a
+    ``[t, 1, h, d]`` sbhd view (fused or unfused). If False, THD frequencies are indexed by the
+    position within each sequence. Requires context_parallel_size == 1."""
+
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
@@ -307,6 +314,12 @@ class TransformerConfig(ModelParallelConfig):
 
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
+
+    attention_output_gate_in_fp32: bool = True
+    """If True, the attention output gate computes ``x * sigmoid(gate)`` in fp32 with a fused
+    kernel and casts the result back to the input dtype. If False, it is computed eagerly in
+    the input dtype (``sigmoid(gate)`` is rounded to that dtype first, as in reference
+    implementations that gate in bf16). Only used when attention_output_gate is True."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -968,6 +981,19 @@ class TransformerConfig(ModelParallelConfig):
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
     a corresponding list of coefficients should be provided here."""
 
+    moe_seq_aux_loss_normalization: Literal['batch_mean', 'per_sequence'] = 'batch_mean'
+    """How the "seq_aux_loss" load balancing loss normalizes over the tokens of each sequence.
+    - "batch_mean": The sequences are the batch entries of the [seq_length, batch] router input,
+    and all of them are normalized by the mean number of valid tokens per sequence.
+    - "per_sequence": Every sequence b is normalized by its own number of valid tokens T_b:
+    loss = coeff * mean_b sum_e (E * c_be / (topk * T_b)) * (P_be / T_b), where c_be counts the
+    valid tokens of b whose top-k of the raw scores (without expert bias) contains expert e, and
+    P_be sums the scores of b normalized over all experts. Counts, sums and T_b are reduced over
+    the tensor- and context-parallel ranks and padding tokens are excluded. The sequences can be
+    given explicitly with the `sequence_ids` and `num_sequences` arguments of `MoELayer.forward`
+    (e.g. for packed or compacted router inputs); they default to the batch entries. Requires
+    `moe_router_load_balancing_type` to include "seq_aux_loss"."""
+
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
 
@@ -1149,7 +1175,7 @@ class TransformerConfig(ModelParallelConfig):
     """Inter-gpu communication type for context parallelism.
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
-    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
+    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p" or "ulysses".
     "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
     overlapped with attention compute.
     "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
@@ -1159,6 +1185,20 @@ class TransformerConfig(ModelParallelConfig):
     "a2a+p2p": A hierarchical implementation of context parallelism to attention.
     It uses A2A communications in low-level CP groups (e.g., via NVLink),
     and P2P communications in high-level CP groups (e.g., via IBLink).
+    "ulysses": Megatron-side Ulysses for TEDotProductAttention and DotProductAttention. An
+    all-to-all gathers the full sequence of q/k/v with 1 / cp of the heads, the attention kernel
+    runs without context parallelism (so the non-causal mask types of that kernel work,
+    including padding, arbitrary and key_padding masks with holes), and an all-to-all returns
+    the output to the sequence shards. Contract: the sequence is sharded contiguously across the
+    CP group (with s the full sequence length, rank r holds positions
+    [r * s / cp, (r + 1) * s / cp)) rather than in TE's zig-zag order, rotary frequencies must be
+    sharded the same way, and the attention mask passed to the layer is CP-global (covers the
+    full sequence). Megatron's built-in context-parallel data and RoPE sharding (e.g. GPT
+    training) is zig-zag, so causal mask types are rejected; use "p2p", "all_gather" or "a2a" for
+    them. Self-attention only: keys and values are exchanged like the queries, so cross-attention
+    raises a ValueError. Requires num_attention_heads and num_query_groups to be divisible by
+    tensor_model_parallel_size * context_parallel_size; sbhd inputs only (no packed sequences);
+    no attention bias, learnable softmax offsets or qk-clip logit tracking.
     """
 
     linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
@@ -2433,6 +2473,26 @@ class TransformerConfig(ModelParallelConfig):
             ) == len(self.moe_router_load_balancing_type), (
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
+            )
+
+        if self.moe_seq_aux_loss_normalization not in ("batch_mean", "per_sequence"):
+            raise ValueError(
+                "moe_seq_aux_loss_normalization must be 'batch_mean' or 'per_sequence', "
+                f"got {self.moe_seq_aux_loss_normalization!r}."
+            )
+        load_balancing_types = (
+            self.moe_router_load_balancing_type
+            if isinstance(self.moe_router_load_balancing_type, list)
+            else [self.moe_router_load_balancing_type]
+        )
+        if (
+            self.moe_seq_aux_loss_normalization == "per_sequence"
+            and "seq_aux_loss" not in load_balancing_types
+        ):
+            raise ValueError(
+                "moe_seq_aux_loss_normalization='per_sequence' requires "
+                "moe_router_load_balancing_type to include 'seq_aux_loss', got "
+                f"{self.moe_router_load_balancing_type!r}."
             )
 
         if self.moe_expert_capacity_factor is not None:
@@ -3821,6 +3881,30 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+            cp_comm_types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            if "ulysses" in cp_comm_types:
+                shards = self.tensor_model_parallel_size * self.context_parallel_size
+                for name in ("num_attention_heads", "num_query_groups"):
+                    if getattr(self, name) % shards != 0:
+                        raise ValueError(
+                            f"cp_comm_type='ulysses' needs {name} ({getattr(self, name)}) to be "
+                            "divisible by tensor_model_parallel_size * context_parallel_size "
+                            f"({shards})."
+                        )
+                if self.softmax_type == "learnable":
+                    raise ValueError(
+                        "cp_comm_type='ulysses' does not support softmax_type='learnable'."
+                    )
+                if self.qk_clip or self.log_max_attention_logit:
+                    raise ValueError(
+                        "cp_comm_type='ulysses' does not support qk_clip or "
+                        "log_max_attention_logit."
+                    )
+
+        if self.rope_freqs_per_token and self.context_parallel_size > 1:
+            raise ValueError("rope_freqs_per_token requires context_parallel_size == 1.")
 
         assert (
             self.pipeline_model_parallel_size > 0
