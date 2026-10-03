@@ -3,6 +3,7 @@
 """rope_freqs_per_token: one rotary frequency row per packed (THD) token."""
 
 import inspect
+import types
 
 import pytest
 import torch
@@ -237,6 +238,31 @@ class TestRopeFreqsPerToken:
     def test_requires_context_parallel_size_1(self):
         with pytest.raises(ValueError, match="rope_freqs_per_token"):
             _config(rope_freqs_per_token=True, context_parallel_size=2)
+        # apply_rotary_pos_emb checks the size of the group it is given (a 2-rank stub here).
+        lengths = LAYOUTS["small"]
+        total = sum(lengths)
+        tokens, _ = _tokens(total, torch.float32)
+        with pytest.raises(ValueError, match="requires context parallel size 1"):
+            apply_rotary_pos_emb(
+                tokens,
+                _per_token_freqs(total),
+                _config(rope_freqs_per_token=True),
+                cu_seqlens=_cu_seqlens(lengths),
+                cp_group=types.SimpleNamespace(size=lambda: 2),
+            )
+
+    def test_rejects_fewer_frequency_rows_than_tokens(self):
+        lengths = LAYOUTS["small"]
+        total = sum(lengths)
+        tokens, _ = _tokens(total, torch.float32)
+        with pytest.raises(ValueError, match=f"got {total - 1} rows for {total} tokens"):
+            apply_rotary_pos_emb(
+                tokens,
+                _per_token_freqs(total - 1),
+                _config(rope_freqs_per_token=True),
+                cu_seqlens=_cu_seqlens(lengths),
+                cp_group=self.cp_group,
+            )
 
     @pytest.mark.parametrize("fused", [True, False])
     @pytest.mark.parametrize(
