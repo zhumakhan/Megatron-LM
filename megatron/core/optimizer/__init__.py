@@ -59,7 +59,6 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
-from ..transformer.moe.moonep_backend import iter_moonep_experts, uses_moonep
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
@@ -71,7 +70,6 @@ from .emerging_optimizers import (
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
-from .moonep_optimizer import MoonEPOptimizer
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -309,7 +307,6 @@ def _get_param_groups(
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     process_group: Optional[torch.distributed.ProcessGroup] = None,
-    param_filter: Optional[Callable[[torch.nn.Parameter], bool]] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -330,8 +327,6 @@ def _get_param_groups(
             empty dictionary rather than the default value of None.
         process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks must construct
             aligned parameter groups. ``None`` preserves the WORLD-group behavior.
-        param_filter (Optional[Callable[[torch.nn.Parameter], bool]]): selects the parameters
-            to group. ``None`` selects the parameters with ``requires_grad``.
     Returns:
         List of parameter groups.
     """
@@ -341,8 +336,7 @@ def _get_param_groups(
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
-            include = param_filter(param) if param_filter is not None else param.requires_grad
-            if not include:
+            if not param.requires_grad:
                 continue
 
             uses_default_config = False
@@ -1033,90 +1027,6 @@ def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> No
                 clearer_fn()
 
 
-def _assert_moonep_optimizer_supported(
-    config: OptimizerConfig, model_chunks: List[MegatronModule], is_mfsdp_v2: bool
-) -> None:
-    """Optimizer-level limits of the MoonEP backend (phase 1)."""
-    optimizer_reason = "MoonEP masters are stepped by MoonEPOptimizer, an FP32Optimizer"
-    overlap_reason = "concurrent NCCL next to MoonEP barrier kernels is untested"
-    ddp_config = getattr(model_chunks[0], "ddp_config", None)
-    checks = [
-        ("optimizer", "'adam'", config.optimizer == "adam", repr(config.optimizer),
-         optimizer_reason),
-        ("use_megatron_fsdp", False,
-         not is_mfsdp_v2 and not getattr(ddp_config, "use_megatron_fsdp", False),
-         True, optimizer_reason),
-        ("use_precision_aware_optimizer", False, not config.use_precision_aware_optimizer,
-         config.use_precision_aware_optimizer, optimizer_reason),
-        ("optimizer_cpu_offload", False, not config.optimizer_cpu_offload,
-         config.optimizer_cpu_offload, optimizer_reason),
-        ("loss_scale", None, not config.loss_scale, config.loss_scale, optimizer_reason),
-        ("fp16", False, not config.fp16, config.fp16, optimizer_reason),
-        ("use_layer_wise_distributed_optimizer", False,
-         not config.use_layer_wise_distributed_optimizer,
-         config.use_layer_wise_distributed_optimizer, optimizer_reason),
-        ("optimizer_cuda_graph", False, not config.optimizer_cuda_graph,
-         config.optimizer_cuda_graph, optimizer_reason),
-    ]
-    if ddp_config is not None:
-        checks += [
-            ("overlap_grad_reduce", False, not ddp_config.overlap_grad_reduce,
-             ddp_config.overlap_grad_reduce, overlap_reason),
-            ("overlap_param_gather", False, not ddp_config.overlap_param_gather,
-             ddp_config.overlap_param_gather, overlap_reason),
-        ]
-    for name, expected, ok, value, reason in checks:
-        if not ok:
-            raise ValueError(f"MoonEP requires {name}={expected} ({reason}), got {value}.")
-
-
-def _get_moonep_optimizer(
-    config: OptimizerConfig,
-    model_chunks: List[MegatronModule],
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
-    param_group_process_group: Optional[torch.distributed.ProcessGroup],
-    grad_stats_parallel_group: torch.distributed.ProcessGroup,
-    pg_collection: Optional[ProcessGroupCollection],
-) -> Optional[MoonEPOptimizer]:
-    """Build the optimizer of the MoonEP expert masters, or None if the model has none.
-
-    The masters are ``requires_grad=False`` parameters (autograd never produces their grads),
-    so every other optimizer skips them. Collective: ``_get_param_groups`` aligns the groups
-    across ranks, so every rank must call this.
-    """
-    moonep_experts = [m for chunk in model_chunks for m in iter_moonep_experts(chunk)]
-    param_groups = _get_param_groups(
-        model_chunks,
-        config,
-        config_overrides,
-        param_group_process_group,
-        param_filter=lambda p: getattr(p, "moonep_master", False),
-    )
-    if not param_groups:
-        return None
-    for param_group in param_groups:
-        # Informational only; not a param_group_identifier_keys entry.
-        param_group["is_moonep"] = True
-    optimizer, init_state_fn = _get_megatron_optimizer_based_on_param_groups(
-        config=config,
-        model_chunks=model_chunks,
-        param_groups=param_groups,
-        skip_megatron_wrapping=True,
-    )
-    # Same config object as the rest of the chain (ChainedOptimizer asserts it).
-    moonep_optimizer = MoonEPOptimizer(optimizer, config, init_state_fn, moonep_experts)
-    # MoonEP grads are unique per EP rank and replicated over expert-DP after finalization.
-    setattr(moonep_optimizer, 'grad_stats_parallel_group', grad_stats_parallel_group)
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    tp_group = pg_collection.tp
-    expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
-    # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
-    setattr(moonep_optimizer, 'tp_group', tp_group)
-    setattr(moonep_optimizer, 'expert_tp_group', expert_tp_group)
-    return moonep_optimizer
-
-
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -1169,9 +1079,6 @@ def get_megatron_optimizer(
     check_config_overrides_consistency(config, config_overrides)
 
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
-    uses_moonep_experts = uses_moonep(get_model_config(model_chunks[0]))
-    if uses_moonep_experts:
-        _assert_moonep_optimizer_supported(config, model_chunks, is_mfsdp_v2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
@@ -1395,20 +1302,6 @@ def get_megatron_optimizer(
                 pg_collection=pg_collection,
             )
         )
-
-    if uses_moonep_experts:
-        # Appended LAST: the chain takes its loss scale from the first optimizer, and the
-        # chained_{idx} checkpoint prefixes of the other optimizers must not shift.
-        moonep_optimizer = _get_moonep_optimizer(
-            config,
-            model_chunks,
-            config_overrides,
-            param_group_process_group,
-            grad_stats_parallel_group=expt_tp_pp_with_egtp_remat_group,
-            pg_collection=pg_collection,
-        )
-        if moonep_optimizer is not None:
-            optimizers.append(moonep_optimizer)
 
     if dump_param_to_param_group_map is not None:
         torch.distributed.checkpoint.save(

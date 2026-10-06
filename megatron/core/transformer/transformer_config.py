@@ -992,7 +992,8 @@ class TransformerConfig(ModelParallelConfig):
     supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
     transformer_engine.pytorch.ep API. "moonep" uses MoonEP's NVLink dispatch/combine with expert
     weight prefetching; it requires every expert-parallel group to live in one NVLink/NVSwitch
-    domain and builds its own grouped-GEMM experts with fp32 master weights."""
+    domain and builds its own grouped-GEMM experts, whose weights are ordinary grouped linear
+    weights computed on staged copies in one buffer shared by all MoE layers."""
 
     moe_moonep_max_tokens_per_rank: Optional[int] = None
     """[Experimental] Token capacity S of the MoonEP communication buffer: the maximum number of
@@ -1003,11 +1004,6 @@ class TransformerConfig(ModelParallelConfig):
     moe_moonep_token_padding: int = 128
     """[Experimental] Every non-empty MoonEP expert segment is padded to a multiple of this many
     tokens (``moonep.Buffer(token_padding=...)``)."""
-
-    moe_moonep_strict_zero_grad: bool = False
-    """[Experimental] Raise instead of warn on MoonEP expert-gradient lifecycle notices, for
-    example a forward that would accumulate into gradients that were not zeroed since the last
-    optimizer step."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1659,20 +1655,21 @@ class TransformerConfig(ModelParallelConfig):
         )
         req(
             self.gtp_weight_remat_size == 1 and self.expert_gtp_weight_remat_size == 1,
-            "gtp_weight_remat_size == expert_gtp_weight_remat_size == 1 (the MoonEP gradient "
-            "scaling mirrors DDP without the GTP correction), got "
+            "gtp_weight_remat_size == expert_gtp_weight_remat_size == 1 (GTP shards the weights "
+            "it rematerializes; MoonEP stages whole experts from unsharded weights), got "
             f"{self.gtp_weight_remat_size} and {self.expert_gtp_weight_remat_size}.",
         )
         req(
             self.pipeline_model_parallel_size == 1,
-            "pipeline_model_parallel_size == 1 (phase 1 keeps one prefetch/reduce slot set per "
-            "layer; a second forward of a layer before its backward silently corrupts "
-            f"gradients), got {self.pipeline_model_parallel_size}.",
+            "pipeline_model_parallel_size == 1 (phase 1 supports one outstanding "
+            "gradient-tracking forward per MoE layer), got "
+            f"{self.pipeline_model_parallel_size}.",
         )
         req(
             self.virtual_pipeline_model_parallel_size is None,
-            "virtual_pipeline_model_parallel_size None (phase 1 keeps one prefetch/reduce slot "
-            f"set per layer), got {self.virtual_pipeline_model_parallel_size}.",
+            "virtual_pipeline_model_parallel_size None (phase 1 supports one outstanding "
+            "gradient-tracking forward per MoE layer), got "
+            f"{self.virtual_pipeline_model_parallel_size}.",
         )
         req(
             self.bf16 and not self.fp16,
@@ -1747,8 +1744,9 @@ class TransformerConfig(ModelParallelConfig):
             not self.overlap_moe_expert_parallel_comm
             and not self.delay_wgrad_compute
             and not self.overlap_dispatch_backward_with_experts_wgrad,
-            "no EP communication overlap or delayed weight-gradient computation (phase 1 keeps "
-            "one prefetch/reduce slot set per layer and computes dW inline), got "
+            "no EP communication overlap or delayed weight-gradient computation (MoonEP's "
+            "shared pools hold one layer's expert copies and gradients at a time, and dW is "
+            "computed inline), got "
             f"overlap_moe_expert_parallel_comm={self.overlap_moe_expert_parallel_comm}, "
             f"delay_wgrad_compute={self.delay_wgrad_compute}, "
             "overlap_dispatch_backward_with_experts_wgrad="
@@ -1759,16 +1757,21 @@ class TransformerConfig(ModelParallelConfig):
             "cuda_graph_impl='none' (MoonEP kernels are shaped by the per-call token count), "
             f"got '{self.cuda_graph_impl}'.",
         )
+        # MoE activation recompute is supported as full block-wise recompute only: its recompute
+        # replays the checkpointed forward's MoonEP plan instead of planning again.
         recompute_modules = self.recompute_modules or []
         req(
-            self.recompute_granularity != "full"
-            and not (
+            self.recompute_granularity != "full" or self.recompute_method == "block",
+            "recompute_method='block' with full recompute (the only MoE activation recompute "
+            f"MoonEP supports), got recompute_method={self.recompute_method}.",
+        )
+        req(
+            not (
                 self.recompute_granularity == "selective"
                 and ("moe" in recompute_modules or "moe_act" in recompute_modules)
             ),
-            "no MoE activation recompute ('full' and selective 'moe' re-run dispatch, planning "
-            "and prefetch inside backward; 'moe_act' is not implemented by MoonEP experts), got "
-            f"recompute_granularity={self.recompute_granularity}, "
+            "no selective 'moe' or 'moe_act' recompute (--moe-layer-recompute is selective "
+            "'moe'; use full recompute with recompute_method='block'), got "
             f"recompute_modules={self.recompute_modules}.",
         )
         req(
@@ -1789,28 +1792,29 @@ class TransformerConfig(ModelParallelConfig):
             f"{self.mtp_use_repeated_layer}.",
         )
         req(
-            not self.cpu_offloading
-            and not self.fine_grained_activation_offloading
-            and not self.moe_paged_stash,
-            "no activation offloading or paged stashing (untested with VMM-backed expert "
-            f"memory), got cpu_offloading={self.cpu_offloading}, "
+            not self.fine_grained_activation_offloading and not self.moe_paged_stash,
+            "no fine-grained activation offloading or paged stashing (untested with MoonEP), "
+            "got "
             f"fine_grained_activation_offloading={self.fine_grained_activation_offloading}, "
             f"moe_paged_stash={self.moe_paged_stash}.",
+        )
+        req(
+            not self.cpu_offloading
+            or (self.recompute_granularity == "full" and self.recompute_method == "block"),
+            "cpu_offloading only together with full recompute and recompute_method='block', got "
+            f"recompute_granularity={self.recompute_granularity}, "
+            f"recompute_method={self.recompute_method}.",
         )
         req(
             not self.init_model_with_meta_device
             and not self.use_cpu_initialization
             and self.transformer_impl != "inference_optimized",
-            "GPU initialization at construction (MoonEP expert memory is VMM allocated and "
-            "mapped across the EP group), got "
+            "GPU initialization at construction (MoonEP initializes its expert weights on the "
+            "GPU under the expert-parallel RNG and builds its VMM pools when the first MoE layer "
+            "is constructed), got "
             f"init_model_with_meta_device={self.init_model_with_meta_device}, "
             f"use_cpu_initialization={self.use_cpu_initialization}, "
             f"transformer_impl='{self.transformer_impl}'.",
-        )
-        req(
-            not self.freeze_base_model_for_mtp,
-            "freeze_base_model_for_mtp=False (it sets requires_grad=True on MoonEP expert masters, "
-            "which must stay out of DDP).",
         )
         req(
             self.hidden_size % 128 == 0

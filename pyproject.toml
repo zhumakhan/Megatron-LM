@@ -251,11 +251,12 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 # MoonEP builds its `moonep._C` CUDA extension through torch's cpp_extension,
 # so its metadata cannot be read without torch. Declare it statically to keep
-# resolution off the build path.
+# resolution off the build path. MoonEP's setup.py pins nvidia-cutlass-dsl
+# 4.6.2, whose libs cap protobuf below 7; its kernels also run on 4.8.
 [[tool.uv.dependency-metadata]]
 name = "moonep"
 version = "0.0.1"
-requires-dist = ["torch", "nvidia-cutlass-dsl>=4.4.2,<4.6"]
+requires-dist = ["torch", "nvidia-cutlass-dsl>=4.6.2,<4.9"]
 
 [tool.uv.sources]
 
@@ -270,7 +271,7 @@ fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-tr
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
 torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "9bc9a442e6d108c7b7903def199896a005143aaf" }
-moonep = { git = "https://github.com/zhumakhan/MoonEP.git", rev = "d9f044b37f24d8d99dc0426e75c7560ed863c889" }
+moonep = { git = "https://github.com/zhumakhan/MoonEP.git", rev = "11713d2d6f6c323ef7cd9f970fa225867e55b529" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

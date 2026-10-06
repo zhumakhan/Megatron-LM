@@ -2514,7 +2514,7 @@ def destroy_model_parallel():
         nccl_ep_finalize()
     except Exception:  # finalize must never block teardown
         pass
-    # Drop the MoonEP Buffer and topology cache without the collective Buffer.destroy(): the
+    # Drop the MoonEP Buffer, expert pools and topology cache without the collective teardown: the
     # only production caller of this function is the in-process-restart fault path, where peers
     # may be gone. The collective destroy runs at the end of pretrain().
     try:

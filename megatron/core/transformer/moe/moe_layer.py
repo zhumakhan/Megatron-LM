@@ -371,8 +371,9 @@ class MoELayer(BaseMoELayer):
 
         # Initialize experts
         if uses_moonep(self.config):
-            # MoonEP owns the expert weights (fp32 masters over bf16 VMM pools that peers
-            # prefetch from), so it builds its own experts instead of the spec's.
+            # MoonEP computes on staged copies of the expert weights in pools shared by every
+            # layer, so it builds its own experts (ordinary grouped linear weights) instead of
+            # the spec's.
             from megatron.core.transformer.moe.moonep_backend.experts import MoonEPGroupedMLP
 
             self.experts = MoonEPGroupedMLP(
@@ -381,7 +382,7 @@ class MoELayer(BaseMoELayer):
                 pg_collection=pg_collection,
                 name=(name + ".experts") if name is not None else None,
             )
-            self.token_dispatcher._comm_manager.bind_storage(self.experts.storage)
+            self.token_dispatcher._comm_manager.bind_experts(self.experts)
             if layer_number is not None:
                 self.experts.set_layer_number(layer_number)
         else:

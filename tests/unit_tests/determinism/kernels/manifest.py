@@ -327,14 +327,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/moonep_backend/autograd.py",
             "megatron/core/transformer/moe/moonep_backend/experts.py",
             "megatron/core/transformer/moe/moonep_backend/manager.py",
+            "megatron/core/transformer/moe/moonep_backend/storage.py",
         ),
         tests=(K + "test_moonep_kernels.py",),
         kind="external-lib",
-        notes="MoonEP flex backend: CuTe DSL dispatch/combine/prefetch/reduce_grad kernels and the "
-        "live-group torch._grouped_mm with fp32 dW accumulation. Replayed at kernel level "
-        "(single GPU) and as a MoELayer with balanced and skewed routing, zeroing with "
-        "zero_moe_grads() (skipped without moonep or >= 2 sm_90+ GPUs). test_moe_kernels.py also "
-        "replays it through the generic flex-moonep MoELayer cell.",
+        notes="MoonEP flex backend: moonep's CuTe DSL dispatch/combine/prefetch/reduce_grad "
+        "kernels (prefetch and reduce_grad run on the expert pools all MoE layers share, "
+        "storage.py) and the [2*epn] torch._grouped_mm whose backward writes the bf16 dW of "
+        "every group into the pools' fp32 view. No fp32 masters: the expert weights are "
+        "ordinary linear_fc{1,2}.weight{i} parameters that DDP / Megatron-FSDP reduce and step "
+        "like any expert weight. Replayed at kernel level (single GPU, with and without a dW "
+        "target) and as a MoELayer with balanced and skewed routing, with and without a "
+        "block-recompute checkpoint, resetting grads with param.grad = None (skipped without "
+        "moonep or >= 2 sm_90+ GPUs). test_moe_kernels.py also replays it through the generic "
+        "flex-moonep MoELayer cell.",
     ),
     KernelEntry(
         name="moe_shared_experts",

@@ -1705,29 +1705,47 @@ def validate_args(args, defaults={}):
             if args.sequence_parallel:
                 max_tokens //= args.tensor_model_parallel_size
             args.moe_moonep_max_tokens_per_rank = max_tokens
-        assert (
-            args.ckpt_format == "torch_dist"
-        ), "MoonEP (phase 1) supports only --ckpt-format torch_dist."
-        assert not args.data_parallel_random_init, (
-            "MoonEP does not support --data-parallel-random-init (it would bypass the bf16 "
-            "pool sync)."
+        # MoonEP stages each layer's whole local experts from their persistent parameters, so
+        # parameters must not be sharded: ZeRO-1 (distributed optimizer, or Megatron-FSDP
+        # 'optim') and ZeRO-2 (Megatron-FSDP 'optim_grads') only.
+        assert not args.use_torch_fsdp2, (
+            "MoonEP does not support torch FSDP2: it shards every parameter over the dense "
+            "data-parallel group. Use Megatron DDP (optionally with --use-distributed-optimizer) "
+            "or Megatron-FSDP with --data-parallel-sharding-strategy optim or optim_grads."
         )
-        assert not (
-            args.use_megatron_fsdp or args.use_torch_fsdp2
-        ), "MoonEP requires Megatron DDP (no FSDP)."
-        assert not args.freeze_all_layers, (
-            "MoonEP (phase 1) does not support --freeze-all-layers: expert masters are "
-            "requires_grad=False by design and would still be stepped (weight decay) by "
-            "MoonEPOptimizer."
-        )
+        if args.use_megatron_fsdp:
+            assert args.megatron_fsdp_version == 1, (
+                "MoonEP supports Megatron-FSDP v1 only (--megatron-fsdp-version 1); v2 requires "
+                "parameter sharding."
+            )
+            strategies = {
+                args.data_parallel_sharding_strategy,
+                args.expert_data_parallel_sharding_strategy or args.data_parallel_sharding_strategy,
+            }
+            assert strategies <= {"optim", "optim_grads"}, (
+                "MoonEP with Megatron-FSDP supports the 'optim' (ZeRO-1) and 'optim_grads' "
+                "(ZeRO-2) sharding strategies only, for dense and expert parameters "
+                f"(the default is optim_grads_params), got {sorted(strategies)}."
+            )
+            assert args.num_distributed_optimizer_instances == 1, (
+                "MoonEP with Megatron-FSDP does not support hybrid sharding "
+                "(--num-distributed-optimizer-instances > 1)."
+            )
+            assert args.outer_dp_sharding_strategy == "no_shard", (
+                "MoonEP with Megatron-FSDP does not support hybrid sharding "
+                "(--outer-dp-sharding-strategy)."
+            )
+            assert not args.megatron_fsdp_enable_fine_grained_param_gather, (
+                "MoonEP with Megatron-FSDP needs whole-layer parameter gathering "
+                "(no --megatron-fsdp-enable-fine-grained-param-gather)."
+            )
+        else:
+            assert args.ckpt_format == "torch_dist", (
+                "MoonEP with Megatron DDP supports only --ckpt-format torch_dist."
+            )
         assert not args.inprocess_restart, (
             "MoonEP (phase 1) does not support --inprocess-restart: a MoonEP device trap "
             "poisons the CUDA context, and Buffer teardown is collective."
-        )
-        assert not (args.overlap_grad_reduce or args.overlap_param_gather), (
-            "MoonEP (phase 1) requires --overlap-grad-reduce and --overlap-param-gather off: "
-            "concurrent NCCL kernels next to MoonEP's cooperative cross-rank barrier kernels "
-            "are untested."
         )
 
     # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.

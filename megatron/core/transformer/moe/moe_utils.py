@@ -778,6 +778,7 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
+    sorted_topk: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -806,6 +807,12 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices (e.g. for quantile balancing). Defaults to None.
+        sorted_topk (bool, optional): Whether the top-k comes back in descending score order.
+                                       The order changes the fp32 rounding of the probabilities,
+                                       so every forward of a training step must sort alike,
+                                       including activation checkpointing's first forward,
+                                       which runs without grad. Defaults to None: sort when grad
+                                       is enabled (inference skips the sort).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -848,6 +855,9 @@ def topk_routing_with_score_function(
             expert_bias=expert_bias,
         )
 
+    if sorted_topk is None:
+        sorted_topk = torch.is_grad_enabled()
+
     def _compute_topk(
         scores: torch.Tensor,
         topk: int,
@@ -879,10 +889,7 @@ def topk_routing_with_score_function(
         else:
             # Sorting top-k turned off during inference
             return torch.topk(
-                scores,
-                k=topk,
-                dim=1,
-                sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
+                scores, k=topk, dim=1, sorted=sorted_topk or is_batch_invariant_mode_enabled()
             )
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):

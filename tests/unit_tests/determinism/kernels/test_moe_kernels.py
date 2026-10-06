@@ -214,6 +214,24 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
+def test_sorted_topk_routing_ignores_grad_mode(score_function):
+    """With sorted_topk=True the routing is bitwise the same with and without grad. A training
+    step's no-grad forwards (activation checkpointing's first forward) pass it, so they round
+    the probabilities like the recompute and like a forward without recompute: an unsorted
+    top-k hands the normalization its terms in another order."""
+    seeded()
+    logits = torch.randn(8192, 64, device="cuda", dtype=torch.float32)
+    kwargs = dict(topk=8, score_function=score_function, sorted_topk=True)
+    with torch.no_grad():
+        no_grad = moe_utils.topk_routing_with_score_function(logits, **kwargs)
+    with_grad = moe_utils.topk_routing_with_score_function(
+        logits.clone().requires_grad_(True), **kwargs
+    )
+    for got, want, what in zip(no_grad, with_grad, ("probs", "routing map")):
+        assert torch.equal(got, want.detach()), f"{what} differ between no-grad and grad"
+
+
 def test_group_limited_topk_replays():
     seeded()
     scores = torch.rand(8192, 256, device="cuda")
@@ -376,6 +394,24 @@ class TestMoEModules:
             contention=hash_routing,
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
+
+    def test_training_router_ignores_grad_mode(self):
+        """A training-mode TopKRouter routes bitwise the same with and without grad: activation
+        checkpointing runs a layer's first forward without grad and its recompute with grad,
+        and both must match a forward without recompute."""
+        self._init()
+        seeded()
+        config = _moe_config(num_moe_experts=64, moe_router_topk=8)
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            probs_no_grad, map_no_grad = router(hidden)
+        probs, routing_map = router(hidden.clone().requires_grad_(True))
+        assert torch.equal(map_no_grad, routing_map), "routing maps differ"
+        assert torch.equal(probs_no_grad, probs.detach()), "probabilities differ"
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_grouped_mlp_replays_on_uneven_experts(self):
@@ -589,9 +625,8 @@ class TestMoEModules:
             input_ids = torch.arange(4096, device="cuda").view(2, 2048) % config.hash_moe_vocab_size
             inputs = {"hidden_states": hidden, "input_ids": input_ids}
         with deterministic_algorithms(True):
-            # The harness zeroes grads with zero_grad(set_to_none=True) plus main_grad.zero_();
-            # MoonEP re-binds its masters' grad aliases on the next forward (with a notice) and
-            # the main_grad views are its persistent grads, so the replay still compares them.
+            # MoonEP's expert weights are ordinary parameters: the harness resets their grads
+            # with zero_grad(set_to_none=True) and compares them like any other expert's.
             assert_module_replays_bit_exact(
                 layer, inputs, replays=3, contention=True, what=f"MoELayer[{dispatcher}, ep={ep}]"
             )

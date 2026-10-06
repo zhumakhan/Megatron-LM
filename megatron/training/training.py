@@ -3333,10 +3333,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
-        # MoonEP expert grads are persistent VMM storage: zeroed in place, never set to None.
-        if uses_moonep(config):
-            for model_chunk in model:
-                model_chunk.zero_moe_grads()
 
         if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.

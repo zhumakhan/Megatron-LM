@@ -4,6 +4,8 @@
 
 import gc
 import importlib.util
+from contextlib import contextmanager
+from unittest import mock
 
 import pytest
 import torch
@@ -33,7 +35,6 @@ requires_moonep = pytest.mark.skipif(
     MOONEP_SKIP_REASON is not None, reason=MOONEP_SKIP_REASON or ""
 )
 
-# Shapes whose expert chunks satisfy the 2 MiB VMM granularity for any EP dividing E.
 NUM_EXPERTS, TOPK, HIDDEN, FFN = 16, 4, 1024, 1024
 
 
@@ -91,16 +92,23 @@ def build_moe_layer(config, layer_number=1):
 
 @torch.no_grad()
 def copy_sequential_to_moonep(base_layer, moonep_layer):
-    """Copy router and SequentialMLP expert weights into a MoonEP layer (fc1 = gate || up)."""
+    """Copy router and SequentialMLP expert weights into a MoonEP layer: expert ``i``'s
+    ``local_experts.{i}.linear_fc{1,2}.weight`` becomes ``linear_fc{1,2}.weight{i}``."""
     moonep_layer.router.weight.copy_(base_layer.router.weight)
-    experts = moonep_layer.experts
-    ffn = experts.config.moe_ffn_hidden_size
+    fc1, fc2 = moonep_layer.experts.expert_weights()
     for i, expert in enumerate(base_layer.experts.local_experts):
-        fc1 = expert.linear_fc1.weight
-        experts.weight_gate[i].copy_(fc1[:ffn])
-        experts.weight_up[i].copy_(fc1[ffn:])
-        experts.weight_down[i].copy_(expert.linear_fc2.weight)
-    experts.sync_compute_weights()
+        fc1[i].copy_(expert.linear_fc1.weight)
+        fc2[i].copy_(expert.linear_fc2.weight)
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+
+@torch.no_grad()
+def copy_moonep_layer(src, dst):
+    """Copy every parameter of a MoonEP MoE layer into another one."""
+    dst_params = dict(dst.named_parameters())
+    for name, param in src.named_parameters():
+        dst_params[name].copy_(param)
     torch.cuda.synchronize()
     torch.distributed.barrier()
 
@@ -119,12 +127,35 @@ def sequential_expert_grads(base_layer):
 
 
 def moonep_expert_grads(moonep_layer):
-    """Per local expert ``(gate, up, down)`` fp32 grads of a MoonEP layer."""
+    """Per local expert ``(gate, up, down)`` fp32 grads of a MoonEP layer: ``.grad`` without a
+    wrapper, ``main_grad`` once DDP or Megatron-FSDP took the gradients over."""
     experts = moonep_layer.experts
-    return [
-        (experts.weight_gate.grad[i], experts.weight_up.grad[i], experts.weight_down.grad[i])
-        for i in range(experts.num_local_experts)
-    ]
+    ffn = experts.config.moe_ffn_hidden_size
+    grads = []
+    for fc1, fc2 in zip(*experts.expert_weights()):
+        g1 = fc1.main_grad if getattr(fc1, "grad_added_to_main_grad", False) else fc1.grad
+        g2 = fc2.main_grad if getattr(fc2, "grad_added_to_main_grad", False) else fc2.grad
+        grads.append((g1[:ffn].float(), g1[ffn:].float(), g2.float()))
+    return grads
+
+
+@contextmanager
+def moonep_calls(buffer):
+    """Count the Buffer's dispatches by kind and its prefetch_weight / reduce_grad calls."""
+    counts = {}
+    with mock.patch.object(buffer, "dispatch", wraps=buffer.dispatch) as dispatch:
+        with mock.patch.object(buffer, "prefetch_weight", wraps=buffer.prefetch_weight) as push:
+            with mock.patch.object(buffer, "reduce_grad", wraps=buffer.reduce_grad) as reduce:
+                yield counts
+                calls = dispatch.call_args_list
+                # A fresh dispatch plans; a replay reuses a plan for tokens and routing weights;
+                # the backward of combine reuses it for the output gradient only.
+                reused = [c for c in calls if c.kwargs.get("plan") is not None]
+                counts["fresh"] = len(calls) - len(reused)
+                counts["replay"] = sum(len(c.args) > 1 for c in reused)
+                counts["combine_backward"] = sum(len(c.args) == 1 for c in reused)
+                counts["prefetch"] = push.call_count
+                counts["reduce"] = reduce.call_count
 
 
 def rel_err(actual, expected):

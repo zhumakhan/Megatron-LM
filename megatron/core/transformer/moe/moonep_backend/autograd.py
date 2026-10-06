@@ -30,37 +30,70 @@ def align_ep_group_on_first_use(group: dist.ProcessGroup, key: Hashable) -> None
     _FIRST_USE_ALIGNED.add(key)
 
 
+def reset_first_use_alignment() -> None:
+    """Forget the aligned call sites: a new Buffer or new pools compile their kernels anew."""
+    _FIRST_USE_ALIGNED.clear()
+
+
 class MoonEPDispatch(torch.autograd.Function):
-    """Dispatch forward / combine backward, plus the per-micro-batch expert-grad reduction.
+    """Dispatch forward / combine backward, plus the expert weights' gradients.
 
     Forward scatters ``[s, H]`` tokens and their ``[s, K]`` fp32 routing weights into the
     expert-grouped ``[plan.nvs_s, ...]`` layout. Backward combines the slot gradients back to
-    ``[s, H]`` and ``[s, K]`` and then runs ``Buffer.reduce_grad``: the prefetched copies' dW,
-    which the grouped GEMMs' backward already wrote into this rank's reduce chunk, are summed
-    into their owners' gradient rows. Those GEMMs are autograd ancestors of this backward, so
-    their writes are enqueued earlier on the same stream; peers are fenced by an inter-rank
-    sync because ``reduce_grad`` has no entry barrier.
+    ``[s, H]`` and ``[s, K]``. With ``wgrad`` it then completes the experts' weight gradients:
+    the grouped GEMMs' backward (autograd descendants of this dispatch, so earlier on the same
+    stream) wrote the layer's dW into the shared fp32 pools; ``Buffer.reduce_grad`` sums the
+    peers' slot dW of this rank's experts into its rows, and the sums go to the parameters.
+
+    The expert weights (``params``: every expert's fc1, then every expert's fc2) are inputs here
+    only so that their gradients reach autograd from this node, after ``reduce_grad``: DDP and
+    Megatron-FSDP start reducing a parameter's gradient as soon as its AccumulateGrad runs. The
+    forward never reads them (the dispatcher stages them into the pools afterwards). They also
+    keep the dispatched tokens differentiable when neither the input nor the router needs grad.
+
+    With a ``plan`` (the recompute of a checkpointed forward), the dispatch reuses that plan:
+    no planning, and ``topk_experts``/``tokens_per_expert`` are ignored. Pass ``plan=None`` for
+    a fresh dispatch. The plan and ``cu_seqlens`` (``None`` on reuse) come back via ``holder``.
     """
 
     @staticmethod
-    def forward(ctx, x, route_weights, topk_experts, tokens_per_expert, buffer, storage, holder):
+    def forward(
+        ctx,
+        x,
+        route_weights,
+        topk_experts,
+        tokens_per_expert,
+        buffer,
+        pools,
+        state,
+        holder,
+        plan,
+        wgrad,
+        *params,
+    ):
         # pylint: disable=missing-function-docstring
-        hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
-            x.contiguous(), route_weights.contiguous(), topk_experts, tokens_per_expert,
-            zero_copy=False,
-        )
-        holder["plan"] = plan
-        ctx.buffer, ctx.plan, ctx.storage = buffer, plan, storage
-        ctx.mark_non_differentiable(cu_seqlens)
-        return hidden_nvsh, route_weights_nvs, cu_seqlens
+        if plan is None:
+            hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
+                x.contiguous(), route_weights.contiguous(), topk_experts, tokens_per_expert,
+                zero_copy=False,
+            )
+        else:
+            hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
+                x.contiguous(), route_weights.contiguous(), plan=plan, zero_copy=False
+            )
+        holder["plan"], holder["cu_seqlens"] = plan, cu_seqlens
+        ctx.buffer, ctx.plan, ctx.pools, ctx.state = buffer, plan, pools, state
+        # Parameter objects, not saved tensors: like Megatron's fused-wgrad linear layers, the
+        # backward writes into their main_grad and never reads their values.
+        ctx.params = params if wgrad else None
+        ctx.num_params = len(params)
+        return hidden_nvsh, route_weights_nvs
 
     @staticmethod
-    def backward(ctx, grad_hidden, grad_route_weights, _grad_cu_seqlens):
+    def backward(ctx, grad_hidden, grad_route_weights):
         # pylint: disable=missing-function-docstring
-        from moonep.inter_rank_sync import launch_inter_rank_sync
-
-        storage = ctx.storage
-        align_ep_group_on_first_use(storage.ep_group, ("dispatch_backward", storage.ep_ranks))
+        pools = ctx.pools
+        align_ep_group_on_first_use(pools.ep_group, ("dispatch_backward", pools.ep_ranks))
         grad_x, grad_route_weights_sk, _ = ctx.buffer.combine(
             plan=ctx.plan,
             hidden_nvsh=grad_hidden.contiguous(),
@@ -68,18 +101,15 @@ class MoonEPDispatch(torch.autograd.Function):
                 None if grad_route_weights is None else grad_route_weights.contiguous()
             ),
         )
-        launch_inter_rank_sync(ctx.buffer._require_ctx())
-        ctx.buffer.reduce_grad(
-            plan=ctx.plan,
-            full_gate_grad=storage.g["gate"],
-            full_up_grad=storage.g["up"],
-            full_down_grad=storage.g["down"],
-            gate_reduce_buffer=storage.rb["gate"],
-            up_reduce_buffer=storage.rb["up"],
-            down_reduce_buffer=storage.rb["down"],
-        )
-        storage.fwd_outstanding = False
-        return grad_x, grad_route_weights_sk, None, None, None, None, None
+        if ctx.params is None:
+            param_grads = (None,) * ctx.num_params
+        else:
+            num_fc1 = ctx.num_params // 2
+            param_grads = pools.reduce_and_copy_out(
+                ctx.plan, ctx.params[:num_fc1], ctx.params[num_fc1:]
+            )
+        ctx.state.fwd_outstanding = False
+        return (grad_x, grad_route_weights_sk) + (None,) * 8 + tuple(param_grads)
 
 
 class MoonEPCombine(torch.autograd.Function):
@@ -87,11 +117,15 @@ class MoonEPCombine(torch.autograd.Function):
 
     Forward gathers every token's K expert outputs back to its source rank and sums them into
     ``[s, H]`` (fp32 accumulation, bf16 output). It does not apply routing weights; the experts
-    scale their rows before fc2. Backward re-dispatches the output gradient with the saved plan.
+    scale their rows before fc2. Backward re-dispatches the output gradient with the saved plan
+    and then re-stages the layer's expert weights in the shared pools (other layers used them
+    since this layer's forward), so the experts' GEMM backward finds them.
+
+    ``restage`` is ``(pools, state, fc1, fc2, wgrad)`` from the layer's dispatch.
     """
 
     @staticmethod
-    def forward(ctx, expert_output, buffer, plan, group, group_ranks):
+    def forward(ctx, expert_output, buffer, plan, group, group_ranks, restage):
         # pylint: disable=missing-function-docstring
         assert expert_output.shape[0] == plan.nvs_s, (
             f"MoonEP combine expects the [plan.nvs_s={plan.nvs_s}, H] layout dispatch returned, "
@@ -99,6 +133,7 @@ class MoonEPCombine(torch.autograd.Function):
         )
         output, _, _ = buffer.combine(plan=plan, hidden_nvsh=expert_output.contiguous())
         ctx.buffer, ctx.plan, ctx.group, ctx.group_ranks = buffer, plan, group, group_ranks
+        ctx.restage = restage
         return output
 
     @staticmethod
@@ -106,26 +141,32 @@ class MoonEPCombine(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         align_ep_group_on_first_use(ctx.group, ("combine_backward", ctx.group_ranks))
         grad_expert_output, _, _, _ = ctx.buffer.dispatch(grad_output.contiguous(), plan=ctx.plan)
-        return grad_expert_output, None, None, None, None
+        pools, state, fc1, fc2, wgrad = ctx.restage
+        if wgrad:
+            pools.begin_grads(state)
+        pools.stage(state, ctx.plan, fc1, fc2)
+        return grad_expert_output, None, None, None, None, None
 
 
 class GroupedMMLiveGrad(torch.autograd.Function):
-    """``torch._grouped_mm`` over the ``[E+B, out, in]`` pool whose dW goes straight to fp32.
+    """``torch._grouped_mm`` over a ``[2*epn, out, in]`` pool whose dW goes straight to fp32.
 
-    On this rank only the own experts ``[lo, hi)`` and the prefetch slots ``[E, E+B)`` hold
-    tokens; every other group is an empty segment of ``offs``. dX runs over all groups (empty
-    ones cost nothing), dW only over the live ones (``offs_live``), and the bf16 dW is added
-    into the fp32 targets (own rows, then slots), so no pool-sized weight gradient exists.
+    The pool rows are this rank's experts and then its prefetch slots, the groups of MoonEP's
+    ``cu_seqlens[2*epn]``, so there are no dead groups. A group without tokens this step (an
+    own expert nobody routed to, an unused slot) costs no FLOPs and its dW is exactly zero.
+    The bf16 dW of all groups overwrites the fp32 target (own experts' rows, then this rank's
+    reduce slots), so the pool never gets a weight gradient of its own; with ``fp32_target``
+    ``None`` (frozen experts) dW is not computed.
     """
 
     @staticmethod
-    def forward(ctx, x, weight, offs, offs_live, fp32_targets):
+    def forward(ctx, x, weight, offs, fp32_target):
         # pylint: disable=missing-function-docstring
-        # The pool is not saved for backward: prefetch_weight rewrites its slot rows in place
-        # and it carries no autograd grad, so version tracking would only raise false positives.
+        # The pool is not saved for backward: it is shared by every layer and restaged before
+        # this backward runs, and it carries no autograd grad, so version tracking would only
+        # raise false positives.
         ctx.save_for_backward(x)
-        ctx.weight, ctx.fp32_targets = weight, fp32_targets
-        ctx.offs, ctx.offs_live = offs, offs_live
+        ctx.weight, ctx.offs, ctx.fp32_target = weight, offs, fp32_target
         return torch._grouped_mm(x, weight.transpose(-2, -1), offs=offs)
 
     @staticmethod
@@ -134,9 +175,8 @@ class GroupedMMLiveGrad(torch.autograd.Function):
         (x,) = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_x = torch._grouped_mm(grad_output, ctx.weight, offs=ctx.offs)
-        grad_weight = torch._grouped_mm(grad_output.t(), x, offs=ctx.offs_live)
-        with torch.no_grad():
-            own, slots = ctx.fp32_targets
-            own.add_(grad_weight[: own.shape[0]])
-            slots.add_(grad_weight[own.shape[0] :])
-        return grad_x, None, None, None, None
+        if ctx.fp32_target is not None:
+            grad_weight = torch._grouped_mm(grad_output.t(), x, offs=ctx.offs)
+            with torch.no_grad():
+                ctx.fp32_target.copy_(grad_weight)
+        return grad_x, None, None, None

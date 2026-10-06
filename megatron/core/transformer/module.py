@@ -86,22 +86,6 @@ class MegatronModule(torch.nn.Module):
         receiver calls it after all parameter and buffer transfers have completed.
         """
 
-    def zero_moe_grads(self) -> int:
-        """Zero MoonEP expert gradients in place; they are persistent storage, never None.
-
-        Works on wrapped chunks (DDP and ``Float16Module`` are ``MegatronModule``\\ s). Call it at
-        the start of every iteration, next to ``optimizer.zero_grad()``.
-
-        Returns:
-            The number of MoonEP expert layers zeroed.
-        """
-        num_layers = 0
-        for module in self.modules():
-            if getattr(module, "_is_moonep_experts", False):
-                module.zero_moonep_grads_()
-                num_layers += 1
-        return num_layers
-
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
         state dict for saving checkpoints.

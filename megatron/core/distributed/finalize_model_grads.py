@@ -27,10 +27,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from .. import parallel_state
 from ..transformer.moe.moe_utils import get_updated_expert_bias
 from ..transformer.moe.moonep_backend import uses_moonep
-from ..transformer.moe.moonep_backend.grads import (
-    reduce_moonep_expert_grads,
-    scale_moonep_expert_grads,
-)
+from ..transformer.moe.moonep_backend.grads import finalize_moonep_step
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -689,10 +686,10 @@ def finalize_model_grads(
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
     for model_chunk in model:
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
-    # MoonEP expert grads live outside DDP's buffers; give them DDP's expert scaling and
-    # expert-DP reduction.
+    # MoonEP expert weights are ordinary DDP/FSDP parameters; only close the step's
+    # activation-recompute bookkeeping.
     if uses_moonep(config):
-        reduce_moonep_expert_grads(model, config, dp_cp_group=dp_cp_group)
+        finalize_moonep_step(model)
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 
@@ -766,5 +763,3 @@ def finalize_model_grads(
         scaling = 1.0 / safe_num_tokens
         for model_chunk in model:
             model_chunk.scale_gradients(scaling)
-        if uses_moonep(config):
-            scale_moonep_expert_grads(model, scaling)

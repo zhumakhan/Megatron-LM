@@ -3,22 +3,29 @@
 """``_MoonEPManager``: the MoonEP backend of ``MoEFlexTokenDispatcher``."""
 
 import importlib.util
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.tensor_parallel.random import is_checkpointing
 from megatron.core.transformer.moe.moonep_backend.autograd import (
     MoonEPCombine,
     MoonEPDispatch,
     align_ep_group_on_first_use,
 )
-from megatron.core.transformer.moe.moonep_backend.buffer import get_moonep_buffer
+from megatron.core.transformer.moe.moonep_backend.buffer import (
+    get_moonep_buffer,
+    get_moonep_expert_pools,
+)
 from megatron.core.transformer.moe.moonep_backend.topology import (
     assert_moonep_ep_group_nvlink_coverage,
 )
 from megatron.core.transformer.moe.token_dispatcher import _DispatchManager
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import ensure_params_ready
 
 INFERENCE_MSG = (
     "MoonEP (phase 1) does not support Megatron inference engines: MoonEP needs the same token "
@@ -46,24 +53,73 @@ def guard_message(layer_number) -> str:
     """Text of the error for a second gradient-tracking forward before the backward."""
     return (
         f"MoonEP: layer {layer_number} started a second gradient-tracking forward before the "
-        "backward of the previous one. Phase 1 keeps one prefetch/reduce slot set per layer, so "
-        "this would silently corrupt gradients. Causes: pipeline/virtual pipeline parallelism, "
-        "overlap_moe_expert_parallel_comm, MoE activation recompute, mlp_chunks_for_training > "
-        "1, repeated MTP layers, or calling the model twice before backward."
+        "backward of the previous one. Phase 1 supports one outstanding gradient-tracking "
+        "forward per MoE layer: the expert weights receive their gradients once per backward, "
+        "and under ZeRO-2 that write overwrites the wrapper's gradient buffer. Causes: "
+        "pipeline/virtual pipeline parallelism, overlap_moe_expert_parallel_comm, "
+        "mlp_chunks_for_training > 1, repeated MTP layers, calling the model twice before "
+        "backward, or a gradient-tracking forward whose backward never ran (run forward-only "
+        "passes under torch.no_grad())."
     )
 
 
+def trainability_message(layer_number, trainable, frozen, mixed) -> str:
+    """Text of the error for expert weights trainable on some EP ranks only."""
+    return (
+        f"MoonEP: the expert weights of MoE layer {layer_number} must be all trainable or all "
+        "frozen on every EP rank: the weight-gradient reduce is collective, and each rank "
+        f"computes dW for the peers' experts it prefetched. Got {trainable} rank(s) trainable, "
+        f"{frozen} frozen and {mixed} mixed. Freeze or unfreeze a layer's experts on every "
+        "rank together."
+    )
+
+
+def recompute_tokens_message(layer_number, num_tokens, recorded) -> str:
+    """Text of the error for a recompute whose token count differs from its forward."""
+    return (
+        f"MoonEP: the activation recompute of MoE layer {layer_number} dispatches {num_tokens} "
+        f"tokens, but the checkpointed forward whose plan it reuses dispatched {recorded}."
+    )
+
+
+def _in_backward() -> bool:
+    """Whether this thread runs an autograd backward, as every checkpoint recompute does."""
+    return torch._C._current_graph_task_id() != -1
+
+
+@dataclass
+class _CheckpointedDispatch:
+    """What the first forward of a checkpointed MoE layer leaves for its recompute."""
+
+    plan: Any  # moonep.MoonEPCommPlan
+    cu_seqlens: torch.Tensor  # [2*epn] int32 segment END offsets
+    token_indices: torch.Tensor  # [T, K] int32 routed experts, the order the plan was built in
+    token_probs: torch.Tensor  # [T, K] fp32 routing weights of that forward
+    num_tokens: int
+
+
 class _MoonEPManager(_DispatchManager):
-    """Dispatch/combine through one process-global ``moonep.Buffer``.
+    """Dispatch/combine through one process-global ``moonep.Buffer`` and expert pool set.
 
     Workflow per MoE layer call:
     (1) ``setup_metadata`` (inside the dispatcher's compiled preprocess): masked top-k of the
         dense probs into fp32 ``[T, K]`` routing weights, int32 expert ids and per-expert counts.
-    (2) ``dispatch``: ``Buffer.dispatch`` (autograd: combine backward plus ``reduce_grad``),
-        then ``Buffer.prefetch_weight`` of this layer's pools with the fresh plan.
+    (2) ``dispatch``: ``Buffer.dispatch`` (autograd: combine backward, then the experts' weight
+        gradients), then ``MoonEPExpertPools.stage``: the layer's expert weights are copied into
+        the shared pools and the collective ``Buffer.prefetch_weight`` pushes every rank's own
+        experts into the prefetch slots of the ranks that copy them.
     (3) The experts run on the dispatched layout; ``get_number_of_tokens_per_expert`` returns
-        the ``[E+B]`` cumulative END offsets, not counts.
-    (4) ``combine``: ``Buffer.combine`` (autograd: plan-reuse dispatch backward).
+        the ``[2*epn]`` cumulative END offsets, not counts.
+    (4) ``combine``: ``Buffer.combine`` (autograd: plan-reuse dispatch backward, then the
+        layer's weights are staged again for its GEMM backward unless the pools still hold them).
+
+    Under full block-wise activation recompute (the only MoE recompute ``_validate_moonep``
+    accepts) a layer's forward runs twice: first without grad inside the checkpoint, then again
+    in the backward. The first forward plans as usual and records its plan; the recompute
+    dispatches with that plan instead of planning again, and stages the weights unless the
+    pools still hold that forward's copies. It replays only when its forward is the layer's one
+    checkpointed forward waiting for a recompute, as in Megatron's schedules; otherwise it plans
+    again (see ``dispatch``).
 
     Args:
         group: the expert-parallel group (expert TP must be 1).
@@ -111,21 +167,32 @@ class _MoonEPManager(_DispatchManager):
             num_sms=config.moe_flex_dispatcher_num_sms,
             token_padding=config.moe_moonep_token_padding,
         )
-        assert int(self.buffer._require_ctx()["B"]) == num_experts // group.size(), (
-            "MoonEP requires B == num_experts / EP prefetch slots."
+        ctx = self.buffer._require_ctx()
+        assert int(ctx["E"]) // int(ctx["R"]) == num_local_experts, (
+            "MoonEP derives num_experts / EP local experts and prefetch slots per rank from the "
+            f"Buffer, got E={ctx['E']}, R={ctx['R']} for {num_local_experts} local experts."
         )
-        self.storage = None
+        # Collective on first use; every rank builds its MoE layers in the same order.
+        self.pools = get_moonep_expert_pools(
+            self.buffer, group, config.hidden_size, config.moe_ffn_hidden_size
+        )
+        self._experts = None
+        self.dense_probs = None
         self.token_probs = None
         self.token_indices = None
         self.tokens_per_expert = None
+        self._checkpointed = None
+        self._restage = None
+        self._trainability_checked = False
         self.dispatched_probs = None
         self.cu_seqlens = None
         self.plan = None
         self.last_plan = None
 
-    def bind_storage(self, storage) -> None:
-        """Attach the layer's ``MoonEPExpertStorage`` (the experts are built after us)."""
-        self.storage = storage
+    def bind_experts(self, experts) -> None:
+        """Attach the layer's ``MoonEPGroupedMLP`` (the experts are built after us)."""
+        self._experts = experts
+        experts.pools = self.pools
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         # Runs under torch.compile (dispatch_preprocess is @jit_fuser): no MoonEP calls here.
@@ -137,6 +204,7 @@ class _MoonEPManager(_DispatchManager):
         token_probs, token_indices = torch.topk(
             probs.masked_fill(~routing_map, float("-inf")), self.router_topk, dim=-1
         )
+        self.dense_probs = probs
         self.token_probs = token_probs.float()
         self.token_indices = token_indices.to(torch.int32)
         self.tokens_per_expert = routing_map.sum(dim=0, dtype=torch.int32)
@@ -149,8 +217,9 @@ class _MoonEPManager(_DispatchManager):
     ) -> torch.Tensor:
         # Phase 1 always runs synchronously on the current stream.
         del async_finish, allocate_on_comm_stream
-        storage = self.storage
-        assert storage is not None, "MoonEP: bind_storage() was not called for this MoE layer."
+        experts = self._experts
+        assert experts is not None, "MoonEP: bind_experts() was not called for this MoE layer."
+        state, pools = experts.moonep_state, self.pools
         num_tokens = hidden_states.shape[0]
         capacity = self.config.moe_moonep_max_tokens_per_rank
         # Every guard raises before the first barrier-bearing MoonEP call, and its condition is
@@ -158,48 +227,149 @@ class _MoonEPManager(_DispatchManager):
         if InferenceMode.is_active():
             raise RuntimeError(INFERENCE_MSG)
         if num_tokens > capacity:
-            raise RuntimeError(capacity_message(storage.layer_number, num_tokens, capacity))
+            raise RuntimeError(capacity_message(state.layer_number, num_tokens, capacity))
         if hidden_states.dtype != torch.bfloat16:
             raise RuntimeError(dtype_message(hidden_states.dtype))
-        # Function.forward runs with grad disabled, so decide this before apply().
+        # Read the weights through the module attributes on every call: DDP re-points parameter
+        # storage, and Megatron-FSDP swaps the attributes for optimizer shards between steps.
+        fc1, fc2 = experts.expert_weights()
+        params = (*fc1, *fc2)
+        if torch.is_grad_enabled() and not self._trainability_checked:
+            self._check_trainability(experts)
+        # Function.forward runs with grad disabled, so decide these before apply().
+        wgrad = torch.is_grad_enabled() and experts.weights_require_grad()
         grad_tracking = torch.is_grad_enabled() and (
-            hidden_states.requires_grad or self.token_probs.requires_grad
+            hidden_states.requires_grad or self.token_probs.requires_grad or wgrad
         )
+        dense_probs, self.dense_probs = self.dense_probs, None
         if grad_tracking:
-            if storage.fwd_outstanding:
-                raise RuntimeError(guard_message(storage.layer_number))
-            storage.fwd_outstanding = True
-        first_use_key = ("dispatch", self._ranks, num_tokens, grad_tracking)
-        align_ep_group_on_first_use(self.group, first_use_key)
+            if state.fwd_outstanding:
+                raise RuntimeError(guard_message(state.layer_number))
+        # An activation checkpoint runs its first forward without grad and the recompute, in the
+        # backward, with grad; is_checkpointing() is set in both. Megatron sets and clears that
+        # flag without try/finally, so a recompute must also run inside a backward: a flag left
+        # set by an exception never turns an ordinary forward into a replay. The record can only
+        # be this recompute's own forward when that forward is the only checkpointed one of the
+        # layer still waiting for its recompute. With more waiting (two forwards before a
+        # backward, or a training-mode forward under no_grad that never gets one), the
+        # recompute plans again. The count changes the same way on every EP rank, so all of them
+        # take the same path.
+        recorded = None
+        if is_checkpointing() and grad_tracking and _in_backward():
+            if state.pending_checkpoints == 1:
+                recorded = self._checkpointed
+            self._checkpointed = None
+            state.pending_checkpoints = max(state.pending_checkpoints - 1, 0)
+            if recorded is not None and recorded.num_tokens != num_tokens:
+                raise RuntimeError(
+                    recompute_tokens_message(state.layer_number, num_tokens, recorded.num_tokens)
+                )
+        if grad_tracking:
+            state.fwd_outstanding = True
         holder = {}
-        hidden_nvsh, route_weights_nvs, cu_seqlens = MoonEPDispatch.apply(
-            hidden_states,
-            self.token_probs,
-            self.token_indices,
-            self.tokens_per_expert,
-            self.buffer,
-            storage,
-            holder,
-        )
-        self.plan = holder["plan"]
-        # One-sided NVLink read of the peers' expert rows this plan copies into the local
-        # slots. Correct because a rank writes its own rows only in sync_compute_weights, which
-        # the inter-rank sync at the start of the dispatch above orders before this read.
-        self.buffer.prefetch_weight(
-            plan=self.plan,
-            full_gate_weight=storage.w["gate"],
-            full_up_weight=storage.w["up"],
-            full_down_weight=storage.w["down"],
-        )
+        if recorded is None:
+            # stage() below reads the weights. A backend that publishes them asynchronously
+            # (DDP with overlap_param_gather) guarantees them only in the owning module's forward
+            # pre-hook, and the modules holding the expert weights never run forward, so finish
+            # the publication here. A recompute runs inside the backward, after the forward
+            # already did this.
+            if not _in_backward():
+                ensure_params_ready(params)
+            first_use_key = ("dispatch", self._ranks, num_tokens, grad_tracking)
+            align_ep_group_on_first_use(self.group, first_use_key)
+            hidden_nvsh, route_weights_nvs = MoonEPDispatch.apply(
+                hidden_states,
+                self.token_probs,
+                self.token_indices,
+                self.tokens_per_expert,
+                self.buffer,
+                pools,
+                state,
+                holder,
+                None,
+                wgrad,
+                *params,
+            )
+            self.plan, cu_seqlens = holder["plan"], holder["cu_seqlens"]
+            # The first forward of a checkpoint records its plan, unless another checkpointed
+            # forward of the layer is still waiting for its recompute. Any other dispatch of the
+            # layer drops the record, so a replayed plan always comes from the forward right
+            # before its recompute.
+            self._checkpointed = None
+            if is_checkpointing() and not torch.is_grad_enabled():
+                state.pending_checkpoints += 1
+                if state.pending_checkpoints == 1:
+                    self._checkpointed = _CheckpointedDispatch(
+                        self.plan, cu_seqlens, self.token_indices, self.token_probs, num_tokens
+                    )
+        else:
+            # Recompute of the layer's only waiting checkpointed forward: dispatch the recomputed
+            # tokens with that forward's plan, so they land where its layout put them, without
+            # planning again. Every EP rank replays its own record, so all of them skip the same
+            # barrier-bearing planning.
+            align_ep_group_on_first_use(self.group, ("dispatch_replay", self._ranks, num_tokens))
+            # The routing weights are the recomputed probabilities at the recorded experts, so
+            # the router gets their gradient. The recompute normally reproduces the forward
+            # bitwise; a recorded expert that it no longer selects (a near tie flipped by an op
+            # that is not deterministic) keeps the forward's weight. finalize_model_grads
+            # reports a layer where many tokens flipped.
+            token_indices = recorded.token_indices.long()
+            reselected = (
+                token_indices.unsqueeze(-1) == self.token_indices.long().unsqueeze(-2)
+            ).any(dim=-1)
+            route_weights = torch.where(
+                reselected, dense_probs.gather(1, token_indices), recorded.token_probs
+            )
+            state.recompute_mismatches.add_((~reselected).any(dim=-1).sum())
+            state.recompute_tokens += num_tokens
+            hidden_nvsh, route_weights_nvs = MoonEPDispatch.apply(
+                hidden_states,
+                route_weights,
+                None,
+                None,
+                self.buffer,
+                pools,
+                state,
+                holder,
+                recorded.plan,
+                wgrad,
+                *params,
+            )
+            self.plan, cu_seqlens = holder["plan"], recorded.cu_seqlens
+        # Copy the layer's weights into the shared pools and push the copies its plan assigns
+        # to peers. Skipped when the pools still hold this layer with this plan: a recompute
+        # right after its own checkpointed forward.
+        pools.stage(state, self.plan, fc1, fc2)
+        self._restage = (pools, state, fc1, fc2, wgrad)
         self.dispatched_probs, self.cu_seqlens = route_weights_nvs, cu_seqlens
         return hidden_nvsh
+
+    def _check_trainability(self, experts) -> None:
+        """Raise on every EP rank unless the layer's experts are trainable on all of them or
+        frozen on all of them.
+
+        Whether a layer computes and reduces dW drives the collective ``reduce_grad``, and a
+        rank's prefetch slots hold its peers' experts, so the decision must be the same on
+        every rank. This runs at the layer's first dispatch with grad enabled, which every
+        rank reaches together; later changes of ``requires_grad`` must keep it uniform.
+        """
+        trainable = experts.trainable_expert_weights()
+        counts = torch.zeros(3, dtype=torch.int64, device=torch.cuda.current_device())
+        counts[{True: 0, False: 1, None: 2}[trainable]] = 1
+        dist.all_reduce(counts, group=self.group)
+        num_trainable, num_frozen, num_mixed = counts.tolist()
+        if num_mixed or (num_trainable and num_frozen):
+            raise RuntimeError(
+                trainability_message(experts.layer_number, num_trainable, num_frozen, num_mixed)
+            )
+        self._trainability_checked = True
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor):
         """Dispatch already produced the expert-grouped layout."""
         return hidden_states, self.dispatched_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        """The ``[E+B]`` int32 cumulative END offsets of the dispatched expert segments."""
+        """The ``[2*epn]`` int32 cumulative END offsets of the dispatched expert segments."""
         return self.cu_seqlens
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor):
@@ -214,7 +384,9 @@ class _MoonEPManager(_DispatchManager):
     ) -> torch.Tensor:
         del async_finish, allocate_on_comm_stream
         align_ep_group_on_first_use(self.group, ("combine", self._ranks))
-        output = MoonEPCombine.apply(hidden_states, self.buffer, self.plan, self.group, self._ranks)
-        self.last_plan, self.plan = self.plan, None
+        output = MoonEPCombine.apply(
+            hidden_states, self.buffer, self.plan, self.group, self._ranks, self._restage
+        )
+        self.last_plan, self.plan, self._restage = self.plan, None, None
         self.dispatched_probs, self.cu_seqlens = None, None
         return output

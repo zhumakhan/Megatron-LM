@@ -2,15 +2,32 @@
 
 """MoonEP backend: distributed checkpoints interchangeable with SequentialMLP.
 
+The MoonEP expert weights are ordinary bf16 parameters, ``linear_fc1.weight{i}`` ``[2*Hi, H]``
+and ``linear_fc2.weight{i}`` ``[H, Hi]``, and their sharded state dict mirrors SequentialMLP's
+torch_dist layout. Checkpoints therefore move bit for bit between MoonEP and SequentialMLP,
+reshard over expert parallelism, and carry the standard distributed optimizer's state of the
+expert weights in both of its torch_dist formats.
+
 Run with ``torch.distributed.run --nproc-per-node <GPUs of one NVLink domain>``, without ``-x``:
 checks are gathered with ``RankChecks`` so every rank fails together.
 """
+
+from argparse import Namespace
+from collections import Counter
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.dist_checkpointing import load, save
+from megatron.core.dist_checkpointing import load, load_plain_tensors, load_tensors_metadata, save
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedObject,
+    ShardedTensor,
+    ShardedTensorFactory,
+    apply_factories,
+)
+from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
 from megatron.core.models.gpt import GPTModel
@@ -21,6 +38,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.core.transformer.moe.moonep_backend import iter_moonep_experts
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.checkpointing import _build_sharded_state_dict_metadata
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -40,10 +58,21 @@ from tests.unit_tests.transformer.moe.moonep_utils import (
 
 pytestmark = [pytest.mark.internal, requires_moonep]
 
-SEQ, MBS, VOCAB = 64, 2, 1024
+SEQ, MBS, VOCAB, NUM_LAYERS = 64, 2, 1024, 2
 MAX_TOKENS = SEQ * MBS
+TOL = 1e-2
 PREFIX = "decoder.layers.0.mlp."
-PROJECTIONS = ("gate", "up", "down")
+# SequentialMLP's sharded keys of the expert weights, under the MoE layer's `experts.` module.
+FC1_KEY = f"{PREFIX}experts.experts.linear_fc1.weight"
+FC2_KEY = f"{PREFIX}experts.experts.linear_fc2.weight"
+EXTRA_STATE_KEYS = [f"{PREFIX}experts.experts.linear_fc{k}._extra_state" for k in (1, 2)]
+
+
+def _expert_dp_ep():
+    """world/2 (4 on 8 GPUs): expert-DP is 2, so the expert weights are replicated and the
+    expert optimizer state is sharded. The world size below 4 GPUs."""
+    ep = Utils.world_size // 2
+    return ep if ep >= 2 and NUM_EXPERTS % ep == 0 else Utils.world_size
 
 
 def _init(ep):
@@ -52,32 +81,97 @@ def _init(ep):
 
 
 def _layer(backend, ep, seed):
+    """An MoE layer with MoonEP or SequentialMLP (alltoall) experts, initialized from ``seed``."""
     _set_random_seed(seed)
     if backend == "moonep":
         return build_moe_layer(moonep_config(ep, MAX_TOKENS))
     return build_moe_layer(alltoall_config(ep))
 
 
-def _load_into(layer, ckpt_dir):
-    loaded = load(layer.sharded_state_dict(prefix=PREFIX), ckpt_dir)
-    return layer.load_state_dict({k.removeprefix(PREFIX): v for k, v in loaded.items()})
-
-
-def _masters(layer):
+def _expert_weights(layer):
+    """``[(fc1, fc2)]`` of the local experts of a MoonEP or SequentialMLP layer."""
     experts = layer.experts
-    return [getattr(experts, f"weight_{n}").detach().clone() for n in PROJECTIONS]
+    if getattr(experts, "_is_moonep_experts", False):
+        return list(zip(*experts.expert_weights()))
+    return [(e.linear_fc1.weight, e.linear_fc2.weight) for e in experts.local_experts]
 
 
-def _check_pools(checks, layer, where):
-    experts, storage = layer.experts, layer.experts.storage
-    for name in PROJECTIONS:
-        checks.equal(
-            f"{where}: {name} pool == master.bf16()",
-            storage.w[name][storage.lo : storage.hi],
-            getattr(experts, f"weight_{name}").bfloat16(),
-        )
-    problems = experts.check_invariants()
-    checks.check(problems == [], f"{where}: {problems}")
+def _global_experts(layer):
+    """``(fc1 [E, 2*FFN, H], fc2 [E, H, FFN])`` of every expert of a MoonEP layer, gathered over
+    EP in global expert order."""
+    experts = layer.experts
+    gathered = []
+    for weights in experts.expert_weights():
+        local = torch.stack([w.detach() for w in weights])
+        parts = [torch.empty_like(local) for _ in range(experts.ep_group.size())]
+        dist.all_gather(parts, local, group=experts.ep_group)
+        gathered.append(torch.cat(parts))
+    return gathered
+
+
+def _hidden():
+    """This rank's ``[SEQ, MBS, H]`` bf16 input of an MoE layer."""
+    gen = torch.Generator(device="cuda").manual_seed(4000 + dist.get_rank())
+    return torch.randn(SEQ, MBS, HIDDEN, dtype=torch.bfloat16, device="cuda", generator=gen)
+
+
+@torch.no_grad()
+def _eval_forward(layer, hidden):
+    """The layer's output in eval mode without grad; a MoonEP layer stages its weights anew."""
+    layer.eval()
+    output, _ = layer(hidden)
+    layer.train()
+    return output
+
+
+def _load_into(layer, ckpt_dir):
+    """Load a layer checkpoint into ``layer``; returns the missing and unexpected keys."""
+    loaded = load(layer.sharded_state_dict(prefix=PREFIX), ckpt_dir)
+    state_dict = {k.removeprefix(PREFIX): v for k, v in loaded.items()}
+    return layer.load_state_dict(state_dict, strict=False)
+
+
+def _shards(sharded_state_dict):
+    """Multiset of every shard once the SwiGLU factories are built: ``(key, global offset,
+    layout)``, a tensor's layout being its dtype, local and global shape, fragmentation,
+    prepended axes and replica id."""
+    apply_factories(sharded_state_dict)
+    shards = Counter()
+    for sh in nested_values(sharded_state_dict):
+        if isinstance(sh, ShardedTensor):
+            layout = (
+                sh.dtype,
+                sh.local_shape,
+                sh.global_shape,
+                sh.axis_fragmentations,
+                sh.prepend_axis_num,
+                sh.replica_id,
+            )
+            shards[(sh.key, sh.global_offset, layout)] += 1
+        elif isinstance(sh, ShardedObject):
+            shards[(sh.key, sh.global_offset, (sh.global_shape, sh.replica_id))] += 1
+        else:
+            shards[("not sharded", type(sh).__name__)] += 1
+    return shards
+
+
+def _checkpoint_layout(ckpt_dir):
+    """Global shape and dtype of every tensor and object (by unique key) in a checkpoint."""
+    metadata = load_sharded_metadata(ckpt_dir)
+    return {key: (sh.global_shape, getattr(sh, "dtype", None)) for key, sh in metadata.items()}
+
+
+def _check_same_checkpoint(checks, first_dir, second_dir):
+    """Both checkpoints hold the same tensors and objects, and bitwise-equal tensor data."""
+    first, second = _checkpoint_layout(first_dir), _checkpoint_layout(second_dir)
+    differ = sorted(k for k in first.keys() | second.keys() if first.get(k) != second.get(k))
+    checks.check(not differ, f"checkpoint entries differ: {differ}")
+    tensors = [
+        {k: v for k, v in load_plain_tensors(d).items() if isinstance(v, torch.Tensor)}
+        for d in (first_dir, second_dir)
+    ]
+    for key in sorted(tensors[0].keys() & tensors[1].keys()):
+        checks.equal(f"checkpoint tensor {key}", tensors[1][key], tensors[0][key])
 
 
 class TestMoonEPCheckpoint:
@@ -85,135 +179,147 @@ class TestMoonEPCheckpoint:
         teardown_moonep()
 
     def test_sharded_keys_match_sequential(self):
-        """Same keys, global shapes and fragment layout as SequentialMLP."""
-        ep = Utils.world_size
+        """The shards of SequentialMLP once the SwiGLU factories are built: keys, global shapes,
+        offsets, fragmentation and replica ids, in bf16. Every expert entry holds the parameter
+        itself, which the distributed optimizer maps its state by. Runs at EP=world/2 where
+        possible, so the replica ids vary over expert-DP."""
+        ep = _expert_dp_ep()
         _init(ep)
         checks = RankChecks()
-        moon = _layer("moonep", ep, seed=1).sharded_state_dict(prefix=PREFIX)
-        fc1 = f"{PREFIX}experts.experts.linear_fc1.weight"
-        fc2 = f"{PREFIX}experts.experts.linear_fc2.weight"
-        gate, up, down = (moon[f"{PREFIX}experts.weight_{n}"] for n in PROJECTIONS)
-        checks.check(gate.key == fc1 and up.key == fc1 and down.key == fc2, "sharded keys")
-        checks.check(gate.global_shape == (NUM_EXPERTS, 2 * FFN, HIDDEN), f"{gate.global_shape}")
-        checks.check(down.global_shape == (NUM_EXPERTS, HIDDEN, FFN), f"{down.global_shape}")
-        epn, ep_rank = NUM_EXPERTS // ep, dist.get_rank()
-        checks.check(gate.global_offset == (ep_rank * epn, 0, 0), f"gate {gate.global_offset}")
-        checks.check(up.global_offset == (ep_rank * epn, FFN, 0), f"up {up.global_offset}")
-        checks.check(gate.data.dtype == torch.float32, "the masters are what is saved")
-        base_keys = {
-            sh.key
-            for sh in _layer("alltoall", ep, seed=1).sharded_state_dict(prefix=PREFIX).values()
-        }
-        moon_keys = {sh.key for sh in moon.values()}
-        checks.check(
-            moon_keys == base_keys,
-            f"only MoonEP: {sorted(moon_keys - base_keys)}, "
-            f"only SequentialMLP: {sorted(base_keys - moon_keys)}",
-        )
+        moon = _layer("moonep", ep, seed=1)
+        base = _layer("sequential", ep, seed=1)
+        experts = moon.experts
+        holders = {}
+        for sh in nested_values(moon.sharded_state_dict(prefix=PREFIX)):
+            if isinstance(sh, (ShardedTensor, ShardedTensorFactory)):
+                holders.setdefault(id(sh.data), []).append(sh)
+        for name, param in experts.named_parameters():
+            found = holders.get(id(param), [])
+            ok = len(found) == 1 and found[0].data is param
+            checks.check(ok, f"{name}: {len(found)} entries hold the parameter itself")
+        moon_shards = _shards(moon.sharded_state_dict(prefix=PREFIX))
+        base_shards = _shards(base.sharded_state_dict(prefix=PREFIX))
+        only_moon = sorted(map(str, moon_shards - base_shards))
+        only_base = sorted(map(str, base_shards - moon_shards))
+        mismatch = f"only MoonEP: {only_moon}; only SequentialMLP: {only_base}"
+        checks.check(not only_moon and not only_base, mismatch)
+        # This rank's experts spelled out: fc1 as its gate and up halves, bf16, one replica per
+        # expert-DP rank.
+        epn, ep_rank = experts.num_local_experts, experts.ep_group.rank()
+        replica = (0, 0, experts.expt_dp_group.rank())
+        e, bf16 = NUM_EXPERTS, torch.bfloat16
+        half = (bf16, (FFN, HIDDEN), (e, 2 * FFN, HIDDEN), (e, 2, 1), 1, replica)
+        fc2 = (bf16, (HIDDEN, FFN), (e, HIDDEN, FFN), (e, 1, 1), 1, replica)
+        for g in range(ep_rank * epn, (ep_rank + 1) * epn):
+            expected = [
+                (FC1_KEY, (g, 0, 0), half),  # gate rows
+                (FC1_KEY, (g, FFN, 0), half),  # up rows
+                (FC2_KEY, (g, 0, 0), fc2),
+            ]
+            expected += [(key, (g,), ((e,), replica)) for key in EXTRA_STATE_KEYS]
+            for shard in expected:
+                checks.check(moon_shards[shard] == 1, f"expert {g}: no shard {shard}")
         free_moonep_models()
         checks.assert_all()
 
-    def test_moonep_round_trip(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize(
+        "src, dst",
+        [("moonep", "moonep"), ("sequential", "moonep"), ("moonep", "sequential")],
+        ids=["moonep-to-moonep", "sequential-to-moonep", "moonep-to-sequential"],
+    )
+    def test_round_trip(self, src, dst, tmp_path_dist_ckpt):
+        """Bitwise round trips between bf16 MoonEP and SequentialMLP layers: the loaded expert
+        weights equal the saved ones, a re-save of the loaded layer reproduces the checkpoint,
+        and the loaded layer computes what the saved one does (bit for bit between MoonEP
+        layers: the next dispatch stages the loaded weights, not the ones it staged before)."""
         ep = Utils.world_size
         _init(ep)
         checks = RankChecks()
-        with TempNamedDir(tmp_path_dist_ckpt / "moonep_round_trip", sync=True) as ckpt_dir:
-            source = _layer("moonep", ep, seed=1)
+        name = f"moonep_round_trip_{src}_to_{dst}"
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir,
+            TempNamedDir(tmp_path_dist_ckpt / f"{name}_resaved", sync=True) as resaved_dir,
+        ):
+            source = _layer(src, ep, seed=1)
+            target = _layer(dst, ep, seed=2)
+            hidden = _hidden()
+            _eval_forward(target, hidden)  # a MoonEP target stages its initial weights
+            want = _expert_weights(source)
+            initial = _expert_weights(target)[0][0]
+            checks.check(not torch.equal(initial, want[0][0]), "seeds should differ")
             save(source.sharded_state_dict(prefix=PREFIX), ckpt_dir)
-            target = _layer("moonep", ep, seed=2)
-            checks.check(
-                not torch.equal(_masters(source)[0], _masters(target)[0]), "seeds should differ"
-            )
             result = _load_into(target, ckpt_dir)
             checks.check(not result.missing_keys and not result.unexpected_keys, f"{result}")
-            for name, got, want in zip(PROJECTIONS, _masters(target), _masters(source)):
-                checks.equal(f"master {name}", got, want)
-            _check_pools(checks, target, "after load")
+            for i, (got, expected) in enumerate(zip(_expert_weights(target), want)):
+                checks.equal(f"expert {i} fc1", got[0], expected[0])
+                checks.equal(f"expert {i} fc2", got[1], expected[1])
             checks.equal("router", target.router.weight, source.router.weight)
-        free_moonep_models()
-        checks.assert_all()
-
-    def test_sequential_to_moonep(self, tmp_path_dist_ckpt):
-        """bf16 SequentialMLP weights load into fp32 masters exactly."""
-        ep = Utils.world_size
-        _init(ep)
-        checks = RankChecks()
-        with TempNamedDir(tmp_path_dist_ckpt / "sequential_to_moonep", sync=True) as ckpt_dir:
-            source = _layer("alltoall", ep, seed=3)
-            save(source.sharded_state_dict(prefix=PREFIX), ckpt_dir)
-            target = _layer("moonep", ep, seed=4)
-            _load_into(target, ckpt_dir)
-            experts = target.experts
-            for i, expert in enumerate(source.experts.local_experts):
-                fc1 = expert.linear_fc1.weight.float()
-                checks.equal(f"gate[{i}]", experts.weight_gate[i], fc1[:FFN])
-                checks.equal(f"up[{i}]", experts.weight_up[i], fc1[FFN:])
-                checks.equal(f"down[{i}]", experts.weight_down[i], expert.linear_fc2.weight.float())
-            _check_pools(checks, target, "after load")
-        free_moonep_models()
-        checks.assert_all()
-
-    def test_moonep_to_sequential(self, tmp_path_dist_ckpt):
-        """fp32 masters load into bf16 SequentialMLP weights as master.bf16()."""
-        ep = Utils.world_size
-        _init(ep)
-        checks = RankChecks()
-        with TempNamedDir(tmp_path_dist_ckpt / "moonep_to_sequential", sync=True) as ckpt_dir:
-            source = _layer("moonep", ep, seed=5)
-            # Give the masters sub-bf16 precision so the rounding on load is exercised.
-            with torch.no_grad():
-                for master in source.experts.moonep_master_parameters():
-                    master.add_(torch.randn_like(master) * 1e-4)
-                source.experts.sync_compute_weights()
-            save(source.sharded_state_dict(prefix=PREFIX), ckpt_dir)
-            target = _layer("alltoall", ep, seed=6)
-            result = _load_into(target, ckpt_dir)
-            checks.check(not result.missing_keys and not result.unexpected_keys, f"{result}")
-            experts = source.experts
-            for i, expert in enumerate(target.experts.local_experts):
-                fc1 = torch.cat((experts.weight_gate[i], experts.weight_up[i])).bfloat16()
-                checks.equal(f"fc1[{i}]", expert.linear_fc1.weight, fc1)
-                checks.equal(
-                    f"fc2[{i}]", expert.linear_fc2.weight, experts.weight_down[i].bfloat16()
-                )
+            save(target.sharded_state_dict(prefix=PREFIX), resaved_dir)
+            _check_same_checkpoint(checks, ckpt_dir, resaved_dir)
+            output, want_output = _eval_forward(target, hidden), _eval_forward(source, hidden)
+            if src == dst:
+                checks.equal("output", output, want_output)
+            else:
+                checks.close("output", output, want_output, TOL)
         free_moonep_models()
         checks.assert_all()
 
     def test_expert_parallel_reshard(self, tmp_path_dist_ckpt):
-        """Save with EP=world, load with EP=world/2 (two expert-DP replicas)."""
+        """Save at EP=world, load at EP=world/2 (two expert-DP replicas): every global expert
+        lands on the ranks that own it at the new EP size, and the layer computes what it did."""
         src_ep = Utils.world_size
         dst_ep = src_ep // 2
         if dst_ep < 2 or NUM_EXPERTS % dst_ep:
             pytest.skip("needs at least 4 GPUs")
+        _init(src_ep)
         checks = RankChecks()
         with TempNamedDir(tmp_path_dist_ckpt / "moonep_ep_reshard", sync=True) as ckpt_dir:
-            _init(src_ep)
             source = _layer("moonep", src_ep, seed=7)
-            full = []
-            for master in source.experts.moonep_master_parameters():
-                parts = [torch.empty_like(master) for _ in range(src_ep)]
-                dist.all_gather(parts, master.detach(), group=source.experts.ep_group)
-                full.append(torch.cat(parts))
+            all_fc1, all_fc2 = _global_experts(source)
+            router = source.router.weight.detach().clone()
+            hidden = _hidden()
+            want_output = _eval_forward(source, hidden)
             save(source.sharded_state_dict(prefix=PREFIX), ckpt_dir)
             del source
             teardown_moonep()
 
             _init(dst_ep)
             target = _layer("moonep", dst_ep, seed=8)
-            _load_into(target, ckpt_dir)
-            storage = target.experts.storage
-            for name, got, want in zip(PROJECTIONS, _masters(target), full):
-                checks.equal(f"master {name}", got, want[storage.lo : storage.hi])
-            _check_pools(checks, target, "after resharded load")
+            experts = target.experts
+            first = experts.ep_group.rank() * experts.num_local_experts
+            initial = _expert_weights(target)[0][0]
+            checks.check(not torch.equal(initial, all_fc1[first]), "seeds should differ")
+            result = _load_into(target, ckpt_dir)
+            checks.check(not result.missing_keys and not result.unexpected_keys, f"{result}")
+            for i, (fc1, fc2) in enumerate(_expert_weights(target)):
+                checks.equal(f"expert {first + i} fc1", fc1, all_fc1[first + i])
+                checks.equal(f"expert {first + i} fc2", fc2, all_fc2[first + i])
+            checks.equal("router", target.router.weight, router)
+            checks.close("output", _eval_forward(target, hidden), want_output, TOL)
         free_moonep_models()
         checks.assert_all()
 
 
+def _ckpt_metadata(sharding_type):
+    """The sharded_state_dict metadata megatron/training/checkpointing.py passes to the model and
+    the optimizer of torch_dist checkpoints with the distributed optimizer:
+    ``--dist-ckpt-optim-fully-reshardable`` selects fully_reshardable, else dp_reshardable."""
+    args = Namespace(
+        use_distributed_optimizer=True,
+        ckpt_format="torch_dist",
+        dist_ckpt_optim_fully_reshardable=sharding_type == "fully_reshardable",
+        distrib_optim_fully_reshardable_mem_efficient=False,
+    )
+    return _build_sharded_state_dict_metadata(args)
+
+
 def _gpt(ep, seed):
+    """GPTModel (every layer MoE on MoonEP) -> Float16Module -> DDP with the distributed
+    optimizer, as megatron/training builds it. Returns ``(model, gpt, optimizer)``."""
     config = TransformerConfig(
         **moe_config_kwargs(
             ep,
-            num_layers=1,
+            num_layers=NUM_LAYERS,
             hidden_dropout=0.0,
             attention_dropout=0.0,
             moe_token_dispatcher_type="flex",
@@ -250,6 +356,8 @@ def _gpt(ep, seed):
 
 
 def _train_step(model, optimizer, seed):
+    """One iteration in megatron/training/training.py:train_step order. Returns this rank's
+    ``[loss sum, tokens]``, the grad norm and whether the step succeeded."""
     gen = torch.Generator(device="cuda").manual_seed(seed * 1000 + dist.get_rank())
     tokens = torch.randint(0, VOCAB, (MBS, SEQ), device="cuda", generator=gen)
     labels = torch.roll(tokens, shifts=-1, dims=1)
@@ -269,8 +377,7 @@ def _train_step(model, optimizer, seed):
 
     model.zero_grad_buffer()
     optimizer.zero_grad()
-    model.zero_moe_grads()
-    forward_backward_no_pipelining(
+    losses = forward_backward_no_pipelining(
         forward_step_func=forward_step,
         data_iterator=None,
         model=model,
@@ -278,8 +385,75 @@ def _train_step(model, optimizer, seed):
         seq_length=SEQ,
         micro_batch_size=MBS,
     )
-    success, _, _ = optimizer.step()
-    return success
+    success, grad_norm, _ = optimizer.step()
+    return losses[0]["lm loss"], grad_norm, success
+
+
+def _expert_optimizers(gpt, optimizer):
+    """The distributed optimizers of the chain whose buffers hold MoonEP expert weights."""
+    moonep = {id(p) for experts in iter_moonep_experts(gpt) for p in experts.parameters()}
+    return [
+        dist_opt
+        for dist_opt in optimizer.chained_optimizers
+        if any(id(p) in moonep for buffer in dist_opt.buffers for p in buffer.param_index_map)
+    ]
+
+
+def _optimizer_shards(gpt, optimizer):
+    """This rank's shards of the fp32 main weights and optimizer states (``param``,
+    ``exp_avg``, ...), by (index of the distributed optimizer in the chain, parameter name)."""
+    names = {id(param): name for name, param in gpt.named_parameters()}
+    return {
+        (index, names[id(param)]): dist_opt._get_main_param_and_optimizer_states(param)
+        for index, dist_opt in enumerate(optimizer.chained_optimizers)
+        for param in dist_opt.model_param_group_index_map
+    }
+
+
+def _group_steps(optimizer):
+    """Step count of every param group of the chain (TE's FusedAdam counts per group)."""
+    return [
+        [None if g.get("step") is None else float(g["step"]) for g in o.optimizer.param_groups]
+        for o in optimizer.chained_optimizers
+    ]
+
+
+def _check_same_training_state(checks, what, a, b):
+    """``a`` and ``b`` are ``(gpt, optimizer)``: every parameter, and this rank's shards of the
+    main weights and optimizer states of every distributed optimizer, bit for bit."""
+    (gpt_a, optim_a), (gpt_b, optim_b) = a, b
+    params_b = dict(gpt_b.named_parameters())
+    for name, param in gpt_a.named_parameters():
+        checks.equal(f"{what}: {name}", params_b[name], param)
+    shards_a, shards_b = _optimizer_shards(gpt_a, optim_a), _optimizer_shards(gpt_b, optim_b)
+    checks.check(shards_a.keys() == shards_b.keys(), f"{what}: different optimizer shards")
+    for key in shards_a.keys() & shards_b.keys():
+        states_a, states_b = shards_a[key], shards_b[key]
+        checks.check(states_a.keys() == states_b.keys(), f"{what}: {key} has {sorted(states_b)}")
+        for state in states_a.keys() & states_b.keys():
+            checks.equal(f"{what}: {key} {state}", states_b[state], states_a[state])
+    moonep = {id(p) for experts in iter_moonep_experts(gpt_a) for p in experts.parameters()}
+    moonep_names = {name for name, param in gpt_a.named_parameters() if id(param) in moonep}
+    compared = sum(name in moonep_names for _, name in shards_a)
+    checks.check(compared > 0, f"{what}: no MoonEP expert weight has optimizer state here")
+    steps_a, steps_b = _group_steps(optim_a), _group_steps(optim_b)
+    checks.check(steps_a == steps_b, f"{what}: param-group steps {steps_b} vs {steps_a}")
+
+
+def _check_gpt_expert_entries(checks, ckpt_dir, sharding_type):
+    """The checkpoint stores the MoonEP weights like SequentialMLP's, bf16 behind a layer and an
+    expert axis; in fully_reshardable format their optimizer states follow the same layout."""
+    tensors = load_tensors_metadata(ckpt_dir)
+    states = ("param", "exp_avg", "exp_avg_sq") if sharding_type == "fully_reshardable" else ()
+    for linear, shape in (("linear_fc1", (2 * FFN, HIDDEN)), ("linear_fc2", (HIDDEN, FFN))):
+        key = f"decoder.layers.mlp.experts.experts.{linear}.weight"
+        global_shape = (NUM_LAYERS, NUM_EXPERTS, *shape)
+        entries = [(key, torch.bfloat16)]
+        entries += [(f"optimizer.state.{state}.{key}", torch.float32) for state in states]
+        for entry, dtype in entries:
+            sh = tensors.get(entry)
+            ok = sh is not None and sh.global_shape == global_shape and sh.dtype == dtype
+            checks.check(ok, f"checkpoint entry {entry}: {sh}")
 
 
 class TestMoonEPOptimizerCheckpoint:
@@ -287,71 +461,48 @@ class TestMoonEPOptimizerCheckpoint:
         destroy_moe_metrics_tracker()
         teardown_moonep()
 
-    def test_model_and_optimizer_round_trip(self, tmp_path_dist_ckpt):
-        """Masters, pools and MoonEPOptimizer Adam states survive save/load."""
-        ep = Utils.world_size
+    @pytest.mark.parametrize("sharding_type", ["dp_reshardable", "fully_reshardable"])
+    def test_model_and_optimizer_round_trip(self, sharding_type, tmp_path_dist_ckpt):
+        """A GPT on MoonEP with expert-DP > 1 (EP=4 on 8 GPUs, so the expert optimizer state is
+        sharded) under DDP and the distributed optimizer, saved after one step: the model in
+        torch_dist, the optimizer in ``sharding_type`` (dp_reshardable is the training default,
+        fully_reshardable is --dist-ckpt-optim-fully-reshardable). A fresh model and optimizer
+        load it with the weights, fp32 main weights and Adam moments of the saved ones, and
+        both copies take the next step bit for bit identically."""
+        ep = _expert_dp_ep()
         _init(ep)
         checks = RankChecks()
-        metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
-        with TempNamedDir(tmp_path_dist_ckpt / "moonep_optimizer", sync=True) as ckpt_dir:
+        metadata = _ckpt_metadata(sharding_type)
+        checks.check(metadata["distrib_optim_sharding_type"] == sharding_type, f"{metadata}")
+        ckpt_name = f"moonep_optimizer_{sharding_type}"
+        with TempNamedDir(tmp_path_dist_ckpt / ckpt_name, sync=True) as ckpt_dir:
             model_a, gpt_a, optim_a = _gpt(ep, seed=11)
-            checks.check(_train_step(model_a, optim_a, seed=1), "step A failed")
-            model_sd = gpt_a.sharded_state_dict()
-            save(
-                {
-                    "model": model_sd,
-                    "optimizer": optim_a.sharded_state_dict(model_sd, metadata=metadata),
-                },
-                ckpt_dir,
-            )
+            layers = len(list(iter_moonep_experts(gpt_a)))
+            checks.check(layers == NUM_LAYERS, f"{layers} MoonEP layers")
+            sizes = [o.data_parallel_group.size() for o in _expert_optimizers(gpt_a, optim_a)]
+            checks.check(sizes == [Utils.world_size // ep], f"expert optimizer DP sizes {sizes}")
+            checks.check(_train_step(model_a, optim_a, seed=1)[2], "step 1 failed")
+            model_sd = gpt_a.sharded_state_dict(metadata=metadata)
+            optim_sd = optim_a.sharded_state_dict(model_sd, metadata=metadata)
+            save({"model": model_sd, "optimizer": optim_sd}, ckpt_dir)
+            _check_gpt_expert_entries(checks, ckpt_dir, sharding_type)
 
             model_b, gpt_b, optim_b = _gpt(ep, seed=12)
-            model_sd = gpt_b.sharded_state_dict()
-            loaded = load(
-                {
-                    "model": model_sd,
-                    "optimizer": optim_b.sharded_state_dict(
-                        model_sd, is_loading=True, metadata=metadata
-                    ),
-                },
-                ckpt_dir,
-            )
-            result = gpt_b.load_state_dict(loaded["model"])
-            checks.check(not result.missing_keys, f"missing keys {result.missing_keys}")
+            model_sd = gpt_b.sharded_state_dict(metadata=metadata)
+            optim_sd = optim_b.sharded_state_dict(model_sd, is_loading=True, metadata=metadata)
+            loaded = load({"model": model_sd, "optimizer": optim_sd}, ckpt_dir)
+            result = gpt_b.load_state_dict(loaded["model"], strict=False)
+            checks.check(not result.missing_keys and not result.unexpected_keys, f"{result}")
             optim_b.load_state_dict(loaded["optimizer"])
+            a, b = (gpt_a, optim_a), (gpt_b, optim_b)
+            _check_same_training_state(checks, "after load", a, b)
 
-            moon_a = optim_a.chained_optimizers[-1].optimizer
-            moon_b = optim_b.chained_optimizers[-1].optimizer
-            layers_a = list(iter_moonep_experts(gpt_a))
-            layers_b = list(iter_moonep_experts(gpt_b))
-            checks.check(len(layers_a) == len(layers_b) == 1, "one MoonEP layer each")
-            for ex_a, ex_b in zip(layers_a, layers_b):
-                pairs = zip(ex_a.moonep_master_parameters(), ex_b.moonep_master_parameters())
-                for pa, pb in pairs:
-                    checks.equal("master", pb, pa)
-                    for key in ("exp_avg", "exp_avg_sq"):
-                        checks.equal(key, moon_b.state[pb][key], moon_a.state[pa][key])
-                    if "step" in moon_a.state[pa]:  # torch Adam; TE FusedAdam steps per group
-                        checks.check(
-                            float(moon_b.state[pb]["step"]) == float(moon_a.state[pa]["step"]),
-                            "per-parameter step",
-                        )
-                storage = ex_b.storage
-                for name in PROJECTIONS:
-                    checks.equal(
-                        f"{name} pool",
-                        storage.w[name][storage.lo : storage.hi],
-                        getattr(ex_b, f"weight_{name}").bfloat16(),
-                    )
-            steps_a = [g.get("step") for g in moon_a.param_groups]
-            steps_b = [g.get("step") for g in moon_b.param_groups]
-            checks.check(steps_a == steps_b, f"param-group steps {steps_a} vs {steps_b}")
             # Both copies keep training identically.
-            checks.check(_train_step(model_a, optim_a, seed=2), "step A2 failed")
-            checks.check(_train_step(model_b, optim_b, seed=2), "step B2 failed")
-            for ex_a, ex_b in zip(layers_a, layers_b):
-                pairs = zip(ex_a.moonep_master_parameters(), ex_b.moonep_master_parameters())
-                for pa, pb in pairs:
-                    checks.equal("master after one more step", pb, pa)
+            loss_a, norm_a, ok_a = _train_step(model_a, optim_a, seed=2)
+            loss_b, norm_b, ok_b = _train_step(model_b, optim_b, seed=2)
+            checks.check(ok_a and ok_b, "step 2 failed")
+            checks.equal("step 2 loss", loss_b, loss_a)
+            checks.check(norm_b == norm_a, f"step 2 grad norm {norm_b} vs {norm_a}")
+            _check_same_training_state(checks, "after one more step", a, b)
         free_moonep_models()
         checks.assert_all()

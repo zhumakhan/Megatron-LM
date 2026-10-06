@@ -1867,7 +1867,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 "MoonEP dispatcher requires expert_tensor_parallel_size == 1 and "
                 "expert_model_parallel_size > 1"
             )
-            # MoELayer binds the experts' VMM storage once the experts exist.
+            # MoELayer binds the experts (their weights and the shared pools) once they exist.
             self._comm_manager = _MoonEPManager(
                 group=self.ep_group,
                 num_local_experts=self.num_local_experts,

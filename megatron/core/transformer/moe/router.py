@@ -961,6 +961,10 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                # Sort in every training forward: activation checkpointing runs its first
+                # forward without grad, and that forward, its recompute and a forward without
+                # recompute must compute the same probabilities.
+                sorted_topk=self.training or torch.is_grad_enabled(),
             )
 
         # Apply token dropping to probs and routing_map.

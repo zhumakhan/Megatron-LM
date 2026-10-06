@@ -1,189 +1,252 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Per-layer VMM expert pools of the MoonEP backend.
+"""The MoonEP pool set shared by every MoE layer of an EP group.
 
-Layout (per projection ``n`` in gate/up/down; one EP rank ``r`` owns experts
-``[lo, hi) = [r*epn, (r+1)*epn)``; ``B == epn`` prefetch slots):
+``moonep.ExpertPools`` gives, per projection ``n`` in gate/up/down (stored ``[out, in]`` like
+Megatron's linear layers):
 
-* ``w[n]``: bf16 ``[E+B, out, in]`` compute weights. Rows ``[0, E)`` map every rank's
-  own-expert chunk (only ``[lo, hi)`` is local memory), rows ``[E, E+B)`` are this rank's
-  prefetch slots, which ``Buffer.prefetch_weight`` fills from peers over NVLink.
-* ``g[n]``: fp32 ``[E+B, out, in]`` gradients in the same layout. Rows ``[lo, hi)`` are this
-  rank's reduced expert gradients (the masters' ``.grad``); rows ``[E, E+B)`` are this rank's
-  reduce chunk, i.e. the same memory as ``rb[n][r]``.
-* ``rb[n]``: fp32 ``[R, B, out, in]`` view of every rank's reduce chunk, which
-  ``Buffer.reduce_grad`` reads.
+* a bf16 compute view ``[2*epn, out, in]``: rows ``[0, epn)`` stage this rank's experts, rows
+  ``[epn, 2*epn)`` hold the copies of remote experts that peers push into its prefetch slots,
+  in the row order of MoonEP's ``cu_seqlens[2*epn]``;
+* an fp32 view of the same shape: rows ``[0, epn)`` collect this rank's experts' gradients, rows
+  ``[epn, 2*epn)`` are its reduce slots, which the owners read in ``Buffer.reduce_grad``.
 
-Weights are stored ``[out, in]`` like Megatron's linear layers, so checkpoints match
-``SequentialMLP``/``TEGroupedMLP``; MoonEP's prefetch and reduce kernels do not care what the
-two inner dims mean. A rank writes only its own rows and its slots; every other row is a live
-mapping of peer memory.
+The expert weights themselves are ordinary parameters owned by DDP or Megatron-FSDP; the pools
+only hold copies. A layer uses them from its dispatch to its combine and again in its backward:
 
-This module uses private MoonEP helpers (``moonep.buffer._*`` and ``moonep._C``) because
-MoonEP exposes no public expert-pool API yet.
+* ``stage`` copies the layer's weights into the staging rows and runs the collective
+  ``Buffer.prefetch_weight`` with the layer's plan, unless the pools already hold exactly that
+  (layer, plan). The forward, every recompute and the backward of a layer each need the copies,
+  and any other layer that ran in between overwrote them.
+* The grouped-GEMM backward writes the layer's dW for all ``2*epn`` groups into the fp32 view;
+  ``reduce_and_copy_out`` adds the peers' slot dW of this rank's experts into its rows and
+  hands the sums to the parameters.
+
+Every rank makes these calls in the same order with the same decisions (all of them host state),
+so the barrier-bearing MoonEP calls match up across the EP group.
 """
 
-import os
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 
+from megatron.core.transformer.moe.moonep_backend.autograd import align_ep_group_on_first_use
+
 PROJECTIONS = ("gate", "up", "down")
 
 
-class MoonEPExpertStorage:
-    """VMM expert weight and gradient pools of one MoE layer. Construction is collective.
+def interleaved_backward_message(layer_number, other_layer_number) -> str:
+    """Text of the error for two layers' gradients in the shared pools at once."""
+    return (
+        f"MoonEP: the backward of MoE layer {layer_number} started while the expert gradients "
+        f"of layer {other_layer_number} were still waiting in the shared pools for their "
+        "reduction. The pools hold one layer's gradients at a time, so MoE layer backwards must "
+        "not interleave."
+    )
+
+
+def ungathered_fsdp_message(layer_number) -> str:
+    """Text of the error for expert weights that no Megatron-FSDP unit hook gathered."""
+    return (
+        f"MoonEP: Megatron-FSDP never gathered the expert weights of MoE layer {layer_number} "
+        "through an FSDP unit's hooks, so it is unknown whether their gradient buffer must be "
+        "overwritten (ZeRO-2) or accumulated, and their values may be stale. The modules "
+        "holding MoonEP's expert weights never run forward: keep every MoE layer inside an "
+        "FSDP unit module (the default units do) and do not enable fine-grained parameter "
+        "gathering."
+    )
+
+
+@dataclass
+class MoonEPLayerState:
+    """Per-layer MoonEP bookkeeping, shared by a layer's dispatcher and experts."""
+
+    layer_number: Optional[int] = None
+    # True between a gradient-tracking dispatch and its backward (phase-1 guard).
+    fwd_outstanding: bool = False
+    # Checkpointed first forwards of this layer whose recompute has not run yet. The
+    # dispatcher replays a recorded plan only while exactly one is waiting.
+    pending_checkpoints: int = 0
+    # Tokens that recomputes of checkpointed forwards dispatched with a replayed plan since
+    # the last check (finalize_model_grads), and how many of them the recompute routed to
+    # another expert set than the forward that made the plan.
+    recompute_tokens: int = 0
+    recompute_mismatches: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(
+            (), dtype=torch.int64, device=torch.cuda.current_device()
+        )
+    )
+
+
+def _main_grad(param: torch.nn.Parameter) -> torch.Tensor:
+    """The wrapper's gradient buffer of ``param`` (DDP's ``main_grad`` or Megatron-FSDP's)."""
+    if getattr(param, "__fsdp_param__", False):
+        # Megatron-FSDP hands out the buffer lazily (ZeRO-2: a temporary bucket per backward).
+        param.main_grad = param.get_main_grad()
+    return param.main_grad
+
+
+def _dummy_grad(param: torch.nn.Parameter) -> torch.Tensor:
+    """What the expert weights return to autograd after their grads went into main_grad.
+
+    A fresh tensor: AccumulateGrad then adopts it as ``.grad`` without a copy, and the wrapper's
+    hook drops it. The hook fires on the backward thread, as overlap_grad_reduce requires.
+    """
+    if getattr(param, "zero_out_wgrad", False):
+        return torch.zeros_like(param)
+    return torch.empty_like(param)
+
+
+class MoonEPExpertPools:
+    """The process-global MoonEP pools of one EP group and expert shape. Creation is collective.
 
     Args:
-        ep_group: expert-parallel group; its ranks must be one NVLink domain.
-        num_experts: total routed experts E.
-        hidden_size: model hidden size H.
+        buffer: the process-global ``moonep.Buffer``.
+        ep_group: its expert-parallel group.
+        hidden_size: H.
         ffn_hidden_size: expert FFN hidden size Hi.
     """
 
     def __init__(
-        self,
-        ep_group: dist.ProcessGroup,
-        num_experts: int,
-        hidden_size: int,
-        ffn_hidden_size: int,
+        self, buffer, ep_group: dist.ProcessGroup, hidden_size: int, ffn_hidden_size: int
     ) -> None:
-        from moonep._C import get_vmm_granularity
-        from moonep.buffer import _use_fabric_for_group
-
-        self.ep_group = ep_group
-        self.ep_ranks = tuple(dist.get_process_group_ranks(ep_group))
-        self.R = ep_group.size()
-        self.rank = ep_group.rank()
-        assert num_experts % self.R == 0, (
-            f"MoonEP: num_moe_experts={num_experts} must be divisible by the EP size {self.R}."
-        )
-        self.E = num_experts
-        self.epn = num_experts // self.R
-        # B == E/R: equal chunk shapes for nvl_dist_map, a slot for every remote expert, and
-        # empty groups outside [lo, hi) and [E, E+B) (MoonEP/README.md).
-        self.B = self.epn
-        self.lo, self.hi = self.rank * self.epn, (self.rank + 1) * self.epn
-        self.layer_number = None
-        # True between a gradient-tracking dispatch and its backward (phase-1 guard).
-        self.fwd_outstanding = False
+        from moonep import ExpertPools
 
         H, Hi = hidden_size, ffn_hidden_size
-        self.chunk_shapes: Dict[str, Tuple[int, int, int]] = {
-            "gate": (self.epn, Hi, H),
-            "up": (self.epn, Hi, H),
-            "down": (self.epn, H, Hi),
-        }
-        granularity = int(get_vmm_granularity())
-        for shape in self.chunk_shapes.values():
-            nbytes = shape[0] * shape[1] * shape[2] * torch.bfloat16.itemsize
-            assert nbytes % granularity == 0, (
-                f"MoonEP: expert chunk {shape} bf16 = {nbytes} bytes must be a multiple of the "
-                f"VMM granularity {granularity} bytes (moonep._C.get_vmm_granularity()); choose "
-                "num_moe_experts/EP, hidden_size and moe_ffn_hidden_size accordingly."
-            )
+        self.buffer = buffer
+        self.ep_group = ep_group
+        self.ep_ranks = tuple(dist.get_process_group_ranks(ep_group))
+        self.hidden_size, self.ffn_hidden_size = H, Hi
+        shapes = {"gate": (Hi, H), "up": (Hi, H), "down": (H, Hi)}
+        self.pools = ExpertPools(buffer, ep_group, shapes)
+        self.epn = self.pools.epn
+        # (layer state, plan) whose weight copies the bf16 pools hold, compared by identity.
+        self.occupant: Optional[tuple] = None
+        # Layer state whose dW sit in the fp32 pools between its GEMM backward and its reduce.
+        self.grads_owner: Optional[MoonEPLayerState] = None
 
-        self._keepalives: List[torch.Tensor] = []
-        # Collective (an all-gather) unless MOONEP_MEM_HANDLE_TYPE=fd; decided once per layer.
-        self._use_fabric = bool(_use_fabric_for_group(ep_group))
-        self.w: Dict[str, torch.Tensor] = {}
-        self.g: Dict[str, torch.Tensor] = {}
-        self.rb: Dict[str, torch.Tensor] = {}
-        for name in PROJECTIONS:
-            self.w[name] = self._composite_weight(self.chunk_shapes[name])
-        for name in PROJECTIONS:
-            self.g[name], self.rb[name] = self._grad_buffers(self.chunk_shapes[name])
-        # cuMemCreate memory is not zero-filled and reduce_grad only clears the slots it
-        # consumes, so the owned rows and the reduce chunk start at zero.
-        self.zero_grads_()
+    # ---- views --------------------------------------------------------------------------------
 
-    # ---- VMM mapping helpers (collective; every rank calls them in the same order) ----------
+    def weights(self, name: str) -> torch.Tensor:
+        """bf16 ``[2*epn, out, in]`` compute view: staged own experts, then prefetch slots."""
+        return self.pools.weights(name)
 
-    def _alloc_chunk(self, chunk_shape, dtype) -> torch.Tensor:
-        """Allocate one VMM chunk on this GPU; return its exported shareable."""
-        from moonep._C import nvl_dist_alloc, nvl_release_mem_handle
+    def grads(self, name: str) -> torch.Tensor:
+        """fp32 ``[2*epn, out, in]``: own experts' grads, then this rank's reduce slots."""
+        return self.pools.grads(name)
 
-        keepalive, shareable, owned = nvl_dist_alloc(
-            shape=list(chunk_shape), dtype=dtype, use_fabric=self._use_fabric
-        )
-        self._keepalives.append(keepalive)
-        nvl_release_mem_handle(owned)
-        return shareable
-
-    def _local_item(self, shareable):
-        return shareable.cpu().view(-1) if self._use_fabric else int(shareable.item())
-
-    def _gathered_items(self, shareable) -> list:
-        """Every rank's item (fabric handle or dup'ed fd) for the chunk ``shareable`` names."""
-        from moonep.buffer import _all_gather_shareables, _exchange_ipc_fds
-
-        if self._use_fabric:
-            handles = _all_gather_shareables(shareable, self.ep_group)
-            return [handles[r] for r in range(self.R)]
-        fds = _exchange_ipc_fds(
-            int(shareable.item()), list(range(self.R)), self.rank, self.R, self.ep_group
-        )
-        return [fds[r] for r in range(self.R)]
-
-    def _map_items(self, chunk_shape, dtype, items) -> torch.Tensor:
-        """Map the chunks in ``items`` back to back into one contiguous virtual range."""
-        from moonep._C import nvl_dist_map
-
-        if self._use_fabric:
-            shareables = torch.stack(items)
-        else:
-            shareables = torch.tensor(items, dtype=torch.int64)
-        mapped = nvl_dist_map(
-            chunk_shape=list(chunk_shape),
-            dtype=dtype,
-            shareables=shareables,
-            local_rank=self.rank,
-            world_size=len(items),
-            use_fabric=self._use_fabric,
-        )
-        mapped._keepalive = self._keepalives
-        return mapped
-
-    def _close_items(self, items) -> None:
-        if not self._use_fabric:
-            for fd in items:
-                os.close(fd)
-
-    def _composite_weight(self, chunk_shape) -> torch.Tensor:
-        """bf16 ``[E+B, ...]``: all R ranks' expert chunks, then this rank's prefetch chunk."""
-        w_share = self._alloc_chunk(chunk_shape, torch.bfloat16)
-        b_share = self._alloc_chunk(chunk_shape, torch.bfloat16)
-        w_items = self._gathered_items(w_share)
-        b_item = self._local_item(b_share)
-        try:
-            return self._map_items(chunk_shape, torch.bfloat16, w_items + [b_item])
-        finally:
-            self._close_items(w_items + [b_item, self._local_item(w_share)])
-
-    def _grad_buffers(self, chunk_shape) -> Tuple[torch.Tensor, torch.Tensor]:
-        """fp32 (grad ``[E+B, ...]``, reduce view ``[R, B, ...]``) for one projection."""
-        g_share = self._alloc_chunk(chunk_shape, torch.float32)
-        r_share = self._alloc_chunk(chunk_shape, torch.float32)
-        g_items = self._gathered_items(g_share)
-        r_items = self._gathered_items(r_share)
-        r_local = self._local_item(r_share)
-        try:
-            grad = self._map_items(chunk_shape, torch.float32, g_items + [r_local])
-            reduce = self._map_items(chunk_shape, torch.float32, r_items)
-        finally:
-            self._close_items(g_items + r_items + [r_local, self._local_item(g_share)])
-        return grad, reduce.view(self.R, self.B, *chunk_shape[1:])
-
-    # ---- accessors ----------------------------------------------------------------------------
-
-    def fp32_targets(self, name: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Where the grouped-GEMM backward adds dW: (own rows ``[lo, hi)``, slots ``[E, E+B)``)."""
-        return self.g[name][self.lo : self.hi], self.g[name][self.E :]
+    # ---- staging --------------------------------------------------------------------------------
 
     @torch.no_grad()
-    def zero_grads_(self) -> None:
-        """Zero this rank's owned gradient rows and its reduce chunk (never peers' rows)."""
-        for name in PROJECTIONS:
-            self.g[name][self.lo : self.hi].zero_()
-            self.g[name][self.E :].zero_()
+    def stage(
+        self,
+        state: MoonEPLayerState,
+        plan: Any,
+        fc1: Sequence[torch.nn.Parameter],
+        fc2: Sequence[torch.nn.Parameter],
+    ) -> bool:
+        """Make the pools hold ``fc1``/``fc2`` copied with ``plan``; returns whether it pushed.
+
+        Collective unless the pools already hold this (layer, plan): every rank keeps the same
+        occupant history, so all of them skip or push together.
+        """
+        if (
+            self.occupant is not None
+            and self.occupant[0] is state
+            and self.occupant[1] is plan
+        ):
+            return False
+        # The copy below overwrites the staging rows, so forget the occupant first: if the
+        # push fails, a later stage of the previous occupant must not be skipped.
+        self.occupant = None
+        Hi = self.ffn_hidden_size
+        gate, up, down = (self.pools.staging(n) for n in PROJECTIONS)
+        # fc1 holds gate rows, then up rows; the pools keep them as separate projections.
+        torch._foreach_copy_(
+            [*gate.unbind(0), *up.unbind(0), *down.unbind(0)],
+            [*(w[:Hi] for w in fc1), *(w[Hi:] for w in fc1), *fc2],
+        )
+        # Every rank pushes its own experts into the slots of the ranks this plan copies them
+        # to; the call ends in a cross-rank barrier. Peers overwrite those slots only in a later
+        # push, which each rank issues after a barrier-bearing dispatch or combine that follows
+        # its last read of the slots, so no read races a write.
+        align_ep_group_on_first_use(self.ep_group, ("prefetch_weight", self.ep_ranks))
+        self.pools.push(plan)
+        self.occupant = (state, plan)
+        return True
+
+    # ---- gradients -------------------------------------------------------------------------------
+
+    def begin_grads(self, state: MoonEPLayerState) -> None:
+        """A layer's backward is about to write its dW into the fp32 pools."""
+        owner = self.grads_owner
+        if owner is not None and owner is not state:
+            raise RuntimeError(interleaved_backward_message(state.layer_number, owner.layer_number))
+        self.grads_owner = state
+
+    def reduce_and_copy_out(
+        self, plan: Any, fc1: Sequence[torch.nn.Parameter], fc2: Sequence[torch.nn.Parameter]
+    ) -> List[torch.Tensor]:
+        """Sum the peers' slot dW of this rank's experts into its own rows (``reduce_grad``),
+        hand the sums to the parameters, and return what autograd gets for them.
+
+        Under DDP and Megatron-FSDP (params carry ``grad_added_to_main_grad``) the fp32 sums go
+        into ``main_grad`` like Megatron's fused-wgrad linear layers (overwriting it when the
+        wrapper asks for that, ZeRO-2) and autograd gets throw-away dummies. Without a wrapper
+        autograd gets the gradients themselves, in the parameters' dtype.
+        """
+        align_ep_group_on_first_use(self.ep_group, ("reduce_grad", self.ep_ranks))
+        self.pools.reduce(plan)
+        owner, self.grads_owner = self.grads_owner, None
+        Hi = self.ffn_hidden_size
+        gate, up, down = (self.pools.local_grads(n) for n in PROJECTIONS)
+        params = [*fc1, *fc2]
+        if not all(hasattr(p, "grad_added_to_main_grad") for p in params):
+            return [torch.cat((gate[i], up[i])).to(w.dtype) for i, w in enumerate(fc1)] + [
+                down[i].to(w.dtype, copy=True) for i, w in enumerate(fc2)
+            ]
+        # Megatron-FSDP marks every parameter __fsdp_param__ when it wraps the model, but sets
+        # overwrite_main_grad only for parameters that an FSDP unit's hooks gathered. The
+        # modules holding the expert weights never run forward, so without an enclosing unit
+        # nothing says whether the buffer must be overwritten (ZeRO-2) or accumulated.
+        # Every rank wraps the same model, so every rank raises here, after the reduce.
+        if any(
+            getattr(p, "__fsdp_param__", False) and not hasattr(p, "overwrite_main_grad")
+            for p in params
+        ):
+            raise RuntimeError(ungathered_fsdp_message(getattr(owner, "layer_number", None)))
+        # (destination, source) pairs, split by whether the wrapper accumulates into main_grad
+        # (DDP, ZeRO-1) or wants it overwritten (ZeRO-2 hands out a fresh bucket per backward).
+        pairs = {False: ([], []), True: ([], [])}
+        for i, w in enumerate(fc1):
+            main_grad = _main_grad(w)
+            dst, src = pairs[bool(getattr(w, "overwrite_main_grad", False))]
+            dst += [main_grad[:Hi], main_grad[Hi:]]
+            src += [gate[i], up[i]]
+        for i, w in enumerate(fc2):
+            dst, src = pairs[bool(getattr(w, "overwrite_main_grad", False))]
+            dst.append(_main_grad(w))
+            src.append(down[i])
+        with torch.no_grad():
+            if pairs[False][0]:
+                torch._foreach_add_(*pairs[False])
+            if pairs[True][0]:
+                torch._foreach_copy_(*pairs[True])
+        dummies = []
+        for w in params:
+            w.grad_added_to_main_grad = True
+            dummies.append(_dummy_grad(w))
+        return dummies
+
+    def end_step(self) -> None:
+        """Forget the step's occupant and gradient owner (``finalize_moonep_step``): no plan
+        of this step matches the next step's staging, and a backward that an exception cut
+        short does not block the next step's."""
+        self.occupant, self.grads_owner = None, None
+
+    def destroy(self) -> None:
+        """Unmap the pools. Collective over the EP group."""
+        self.occupant, self.grads_owner = None, None
+        self.pools.destroy()
