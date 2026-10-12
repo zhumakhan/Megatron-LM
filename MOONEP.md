@@ -14,7 +14,7 @@
 | Megatron-LM | `/pfs/code/Megatron-LM` @ `dba89efc5` ("fix recompute merge") plus the uncommitted redesign (`git status`). The pre-MoonEP baseline is `1912044d7`; `git diff 1912044d7 -- <file>` shows the whole MoonEP change of a file. `megatron/core/optimizer/__init__.py`, `megatron/core/transformer/module.py` and `test_optimizer_kernels.py` are back to `1912044d7`; `megatron/core/optimizer/moonep_optimizer.py` is deleted. |
 | MoonEP | `/pfs/code/MoonEP-Fork` @ `30c2f8c` = upstream `33327eb` ("Public Release 26/09") + `753befe` (runtime varlen, `1 <= s <= S`) + `30c2f8c` (reference model on the new API), plus the uncommitted `moonep.ExpertPools`: `moonep/expert_pools.py`, its export in `moonep/__init__.py`, the README section "Sharing expert pools across layers" and `tests/test_expert_pools.py`. Package `moonep 0.0.1`. |
 | Python env | `/pfs/code/megatron-minimax-experiments/.venv`: Python 3.12.3, torch 2.14.1, TransformerEngine 2.19.0, nvidia-cutlass-dsl 4.8.0, cuda-bindings 13.4.3, megatron-core 0.20.0. Not installed: pytest, isort, black. |
-| GPU node | `slinky-1`: 8x NVIDIA H200 (sm_90) on NVSwitch with working multicast, driver 580.126.09, no host compiler. `moonep._C` there is a host-only C++ build of `MoonEP/csrc/bindings.cu` made on the login node (§9 item 2). A pytest stand-in runs the unit tests. |
+| GPU node | `slinky-1`: 8x NVIDIA H200 (sm_90) on NVSwitch with working multicast, driver 580.126.09, no host compiler. `moonep._C` there is a host-only C++ build of `MoonEP/csrc/bindings.cu` made on the login node (§9 item 2). The unit tests ran first under a pytest stand-in, then under pytest 9.1.1 (Appendix A.3 (2)). |
 | Historical | A B200 VM with MoonEP `d9f044b` (A.1) and `slinky-0` with an emulated `moonep._C` and multicast (A.2). Both ran the earlier design. |
 
 **Citation conventions.**
@@ -355,7 +355,8 @@ No module imports `moonep` at module level, so Megatron imports without MoonEP (
 | `cuda_graph_impl == 'none'` | 1754-1758 | "MoonEP kernels are shaped by the per-call token count" |
 | full recompute only with `recompute_method='block'` | 1762-1766 | "the only MoE activation recompute MoonEP supports" |
 | no selective `moe` or `moe_act` recompute | 1767-1775 | "--moe-layer-recompute is selective 'moe'; use full recompute with recompute_method='block'" |
-| no `hybrid_context_parallel`, `sequence_packing_scheduler` or `variable_seq_lengths` | 1776-1785 | rule text: "the same token count on every EP rank" |
+| `sequence_packing_scheduler is None` | 1777-1782 | "its packs differ in size between EP ranks and can exceed moe_moonep_max_tokens_per_rank". Never reached today: the generic packing check rejects every non-alltoall MoE dispatcher first with an AssertionError (`transformer_config.py:4060-4064`); `test_moonep_config.py::test_sequence_packing_scheduler_rejected` covers both |
+| no `hybrid_context_parallel` or `variable_seq_lengths` | 1783-1788 | rule text: "the same token count on every EP rank" |
 | `mlp_chunks_for_training == 1`, `not mtp_use_repeated_layer` | 1786-1792 | rule text: "one call per MoE layer per micro-batch" |
 | no `fine_grained_activation_offloading` or `moe_paged_stash` | 1793-1799 | "untested with MoonEP" |
 | `cpu_offloading` only with full block recompute | 1800-1806 | none |
@@ -440,17 +441,17 @@ python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
 
 | File | Cases | EP | Coverage |
 |---|---|---|---|
-| `test_moonep_config.py` | 58 | CPU | every `_validate_moonep` rule (`test_forbidden_overrides`); allowed block recompute, block recompute with CPU offloading and `freeze_base_model_for_mtp`; the `moe_enable_deepep` conflict; missing package; `validate_args` accepting DistOpt with both overlaps and Megatron-FSDP `optim`/`optim_grads`, and rejecting `optim_grads_params` (also as the CLI default), v2, hybrid sharding, fine-grained gathering, torch FSDP2 and non-`torch_dist` DDP formats |
+| `test_moonep_config.py` | 91 | CPU | every `_validate_moonep` rule (`test_forbidden_overrides`); allowed block recompute, block recompute with CPU offloading and `freeze_base_model_for_mtp`; the `moe_enable_deepep` conflict; missing package; `validate_args` accepting DistOpt with both overlaps and Megatron-FSDP `optim`/`optim_grads`, and rejecting `optim_grads_params` (also as the CLI default), v2, hybrid sharding, fine-grained gathering, torch FSDP2 and non-`torch_dist` DDP formats |
 | `test_moonep_topology.py` | 24 | 8, 4 | 18 pure evaluator cases (pass, cross-host, fabric health, P2P status, handle path, multicast, duplicate GPU, compute capability, tmpdir, missing fields); live pass at EP=world and world/2; live negatives raising the identical error on every rank; WORLD consensus; contained local-probe exceptions |
-| `test_moonep_layer.py` | 20 | 8 | Buffer cache, destroy and release; one pool set shared by all layers, its shapes and all-rank mapping, parameter names, dtype and `allreduce`; `Float16Module` casting; parity with alltoall plus SequentialMLP (output, input, router and expert grads; 1 push, 1 reduce); below capacity (`s < S`); skewed routing, with every used slot equal to its owner's bf16 weights; 3 accumulated micro-batches; a 3-layer chain bitwise equal to each layer alone (balanced and skewed; 5 pushes); interleaved `F_A F_B B_B B_A` equal to sequential order; no-grad forwards between a forward and its backward; an in-place weight update reaching the next forward; `main_grad` hand-off, accumulating and overwriting; frozen router and input; frozen experts (no grads, no `reduce_grad`, partly frozen raises); the phase-1 guard; capacity and inference guards; initialization equal to SequentialMLP's |
-| `test_moonep_recompute.py` | 16 | 8 | replay against recompute without replay, bitwise (balanced and skewed, 3 micro-batches); an eval forward dropping the record; schedules with several waiting checkpoints planning afresh; `finalize_moonep_step` forgetting a forward without backward; a stuck checkpoint flag not replaying outside a backward; mismatch reporting (1 token quiet, all tokens warn); `GPTModel` with 4 MoE layers under block recompute, also with CPU offloading inside and past the checkpointed window, bitwise against the reference with `2*(2N-1)` pushes |
+| `test_moonep_layer.py` | 24 | 8 | Buffer cache, destroy and release; one pool set shared by all layers, its shapes and all-rank mapping, parameter names, dtype and `allreduce`; `Float16Module` casting; parity with alltoall plus SequentialMLP (output, input, router and expert grads; 1 push, 1 reduce); below capacity (`s < S`); skewed routing, with every used slot equal to its owner's bf16 weights; 3 accumulated micro-batches; a 3-layer chain bitwise equal to each layer alone (balanced and skewed; 5 pushes); interleaved `F_A F_B B_B B_A` equal to sequential order; no-grad forwards between a forward and its backward; an in-place weight update reaching the next forward; `main_grad` hand-off, accumulating and overwriting; frozen router and input; frozen experts (no grads, no `reduce_grad`, partly frozen raises); the phase-1 guard; capacity and inference guards; initialization equal to SequentialMLP's |
+| `test_moonep_recompute.py` | 17 | 8 | replay against recompute without replay, bitwise (balanced and skewed, 3 micro-batches); an eval forward dropping the record; schedules with several waiting checkpoints planning afresh; `finalize_moonep_step` forgetting a forward without backward; a stuck checkpoint flag not replaying outside a backward; mismatch reporting (1 token quiet, all tokens warn); `GPTModel` with 4 MoE layers under block recompute, also with CPU offloading inside and past the checkpointed window, bitwise against the reference with `2*(2N-1)` pushes |
 | `test_moonep_training.py` | 11 | 8, 4 | DDP `main_grad` parity with SequentialMLP after `finalize_model_grads` (expert-DP 1 and 2, per-token loss, `average_in_collective`); DDP's NaN check covering expert grads; parameter groups and overrides (MuP) equal to SequentialMLP's; 5-step loss parity under plain DDP with the alltoall optimizer chain; the distributed optimizer's chain, buffers and element ownership, plus 3 steps at expert-DP 1 and 2; `overlap_grad_reduce` and `overlap_param_gather` at expert-DP 2 with one bucket per layer's experts, expert replicas equal after every forward |
 | `test_moonep_checkpoint.py` | 7 | 8, 4 | sharded keys, shapes, offsets and replica ids equal to SequentialMLP's, each entry holding the parameter; bitwise round trips MoonEP to MoonEP, SequentialMLP to MoonEP and MoonEP to SequentialMLP, with a bitwise re-save; EP 8 to 4 resharding; a GPT with the distributed optimizer at EP=4 saved in `dp_reshardable` and `fully_reshardable`, loaded into a fresh model, and stepping bitwise like the original |
 | `test_moonep_fsdp.py` | 23 | 4 | Megatron-FSDP `optim`/`optim_grads` against alltoall under the same wrapper (balanced and skewed, per-expert grad norms); against MoonEP under DDP with the distributed optimizer (tight tolerance); a ZeRO-2 stress cell with 4 MoE layers, 4 micro-batches, block recompute and skewed routing; `fsdp_dtensor` naming by global expert id; `fsdp_dtensor` round trip from `optim` to `optim_grads`; the wrapper check on CPU (14 cases: other strategies including `no_shard`, hybrid sharding, fine-grained gathering, MoE layers outside FSDP units, parameter-sharding wrappers, accepted ZeRO-1/2 configurations) |
 | `test_moonep_kernels.py` | 7 | 1, 8 | `GroupedMMLiveGrad` against a per-group fp32 reference with empty groups giving exact-zero dW, rows past the last segment never read, and the target's old contents overwritten; no dW GEMM without a target; bitwise replays under stream contention; a MoonEP `MoELayer` replaying bitwise, balanced and skewed, with and without a block-recompute checkpoint |
 | `test_moe_kernels.py[flex-moonep-ep2]` | 1 | 2 | the generic MoE-layer replay cell with standard grad zeroing (`test_moe_kernels.py:548-561`) |
 
-Counts are parametrized cases at the time of writing; `test_moonep_fsdp.py` was still changing.
+Counts are the cases pytest collected on 2026-10-06 at `a17669776` (Appendix A.3 (2)).
 
 **Determinism registration.** The `moe_moonep` entry registers `autograd.py`, `experts.py`, `manager.py` and `storage.py` with `test_moonep_kernels.py` (`kernels/manifest.py:324-344`). `token_dispatcher.py` and `moe_layer.py` are sources of other entries, which `test_moe_kernels.py[flex-moonep-ep2]` covers.
 
@@ -507,19 +508,19 @@ Counts are parametrized cases at the time of writing; `test_moonep_fsdp.py` was 
 | per-rank `s` with `total_num_tokens` | TBD | TBD |
 | `MoonEP/tests/test_expert_pools.py` (6 tests: layout and aliasing, push, reduce, two layers sharing pools, idempotent destroy, argument checks) | TBD | n/a |
 
-**(2) Megatron unit tests** (cases as counted in §8).
+**(2) Megatron unit tests** (cases as counted in §8). Run on 2026-10-06 at `a17669776` with MoonEP-Fork `11713d2`, under real pytest 9.1.1 rather than the stand-in: one `torch.distributed.run --nproc-per-node 8 -m pytest -q -p no:cacheprovider <file>` per file, `NCCL_ALGO=Ring`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, `CUDA_DEVICE_MAX_CONNECTIONS` unset. `test_moonep_fsdp.py` ran in a separate job without the two determinism variables. All 8 ranks reported the same result for every file. Wall time includes process start and MoonEP's first-use kernel compilation.
 
-| File | Cases | Passed / skipped / failed |
-|---|---|---|
-| `test_moonep_config.py` | 58 | TBD |
-| `test_moonep_topology.py` | 24 | TBD |
-| `test_moonep_layer.py` | 20 | TBD |
-| `test_moonep_recompute.py` | 16 | TBD |
-| `test_moonep_training.py` | 11 | TBD |
-| `test_moonep_checkpoint.py` | 7 | TBD |
-| `test_moonep_fsdp.py` | 23 | TBD |
-| `test_moonep_kernels.py` | 7 | TBD |
-| `test_moe_kernels.py[flex-moonep-ep2]` | 1 | TBD |
+| File | Cases | Passed / skipped / failed | Wall time |
+|---|---|---|---|
+| `test_moonep_config.py` | 91 | 91 / 0 / 0 | 1:34 |
+| `test_moonep_topology.py` | 24 | 24 / 0 / 0 | 1:18 |
+| `test_moonep_layer.py` | 24 | 24 / 0 / 0 | 5:15 |
+| `test_moonep_recompute.py` | 17 | 17 / 0 / 0 | 4:05 |
+| `test_moonep_training.py` | 11 | 11 / 0 / 0 | 5:02 |
+| `test_moonep_checkpoint.py` | 7 | 7 / 0 / 0 | 4:06 |
+| `test_moonep_fsdp.py` | 23 | 23 / 0 / 0 | 4:49 (pytest) |
+| `test_moonep_kernels.py` | 7 | 7 / 0 / 0 | 2:32 |
+| `test_moe_kernels.py[flex-moonep-ep2]` (`-k moonep`, 55 deselected) | 1 | 1 / 0 / 0 | 2:08 |
 
 **(3) End-to-end ZeRO matrix.** `pretrain_gpt.py --mock-data` for 8 iterations: 4 layers, all MoE; hidden 512, 8 heads, sequence 1024, micro-batch 4 and global batch 64 (two micro-batches per step on 8 ranks); 16 experts, top-4, `moe_ffn_hidden_size` 1024, fp32 router, aux loss 1e-2; `--transformer-impl transformer_engine`, `--deterministic-mode`, `--no-gradient-accumulation-fusion`, distributed optimizer. The baseline is alltoall with TEGroupedMLP (`--moe-grouped-gemm`) under the same wrapper. DistOpt rows save `torch_dist`; Megatron-FSDP rows save `fsdp_dtensor` with `--megatron-fsdp-main-grads-dtype fp32`. CDMC is `CUDA_DEVICE_MAX_CONNECTIONS`. Loss and grad norm are at iteration 8; memory is the max allocated memory in the log.
 

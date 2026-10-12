@@ -4,7 +4,7 @@
 
 import importlib.util
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -214,6 +214,7 @@ class _MoonEPManager(_DispatchManager):
         hidden_states: torch.Tensor,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        total_num_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         # Phase 1 always runs synchronously on the current stream.
         del async_finish, allocate_on_comm_stream
@@ -275,7 +276,7 @@ class _MoonEPManager(_DispatchManager):
             # already did this.
             if not _in_backward():
                 ensure_params_ready(params)
-            first_use_key = ("dispatch", self._ranks, num_tokens, grad_tracking)
+            first_use_key = ("dispatch", self._ranks, grad_tracking)
             align_ep_group_on_first_use(self.group, first_use_key)
             hidden_nvsh, route_weights_nvs = MoonEPDispatch.apply(
                 hidden_states,
@@ -287,6 +288,7 @@ class _MoonEPManager(_DispatchManager):
                 state,
                 holder,
                 None,
+                total_num_tokens,
                 wgrad,
                 *params,
             )
@@ -307,7 +309,7 @@ class _MoonEPManager(_DispatchManager):
             # tokens with that forward's plan, so they land where its layout put them, without
             # planning again. Every EP rank replays its own record, so all of them skip the same
             # barrier-bearing planning.
-            align_ep_group_on_first_use(self.group, ("dispatch_replay", self._ranks, num_tokens))
+            align_ep_group_on_first_use(self.group, ("dispatch_replay", self._ranks))
             # The routing weights are the recomputed probabilities at the recorded experts, so
             # the router gets their gradient. The recompute normally reproduces the forward
             # bitwise; a recorded expert that it no longer selects (a near tie flipped by an op
@@ -332,6 +334,7 @@ class _MoonEPManager(_DispatchManager):
                 state,
                 holder,
                 recorded.plan,
+                total_num_tokens,
                 wgrad,
                 *params,
             )

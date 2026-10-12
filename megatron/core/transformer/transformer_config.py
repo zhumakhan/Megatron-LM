@@ -1775,13 +1775,15 @@ class TransformerConfig(ModelParallelConfig):
             f"recompute_modules={self.recompute_modules}.",
         )
         req(
-            not self.hybrid_context_parallel
-            and self.sequence_packing_scheduler is None
-            and not self.variable_seq_lengths,
-            "the same token count on every EP rank (no hybrid context parallelism, sequence "
-            f"packing or variable sequence lengths), got "
-            f"hybrid_context_parallel={self.hybrid_context_parallel}, "
-            f"sequence_packing_scheduler={self.sequence_packing_scheduler}, "
+            self.sequence_packing_scheduler is None,
+            "no sequence packing scheduler (its packs differ in size between EP ranks and can "
+            "exceed moe_moonep_max_tokens_per_rank), got sequence_packing_scheduler="
+            f"'{self.sequence_packing_scheduler}'.",
+        )
+        req(
+            not self.hybrid_context_parallel and not self.variable_seq_lengths,
+            "the same token count on every EP rank (no hybrid context parallelism or variable "
+            f"sequence lengths), got hybrid_context_parallel={self.hybrid_context_parallel}, "
             f"variable_seq_lengths={self.variable_seq_lengths}.",
         )
         req(

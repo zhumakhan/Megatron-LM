@@ -209,6 +209,21 @@ def test_forbidden_overrides(overrides, match):
         TransformerConfig(**moonep_config_kwargs(**overrides))
 
 
+def test_sequence_packing_scheduler_rejected():
+    # The generic packing check (alltoall only) runs before _validate_moonep and already rejects
+    # every flex backend, so the MoonEP rule is also checked on its own.
+    packing = dict(sequence_packing_scheduler="dp_balanced", max_seqlen_per_dp_cp_rank=512)
+    with pytest.raises(
+        (AssertionError, ValueError),
+        match="sequence_packing only supports|no sequence packing scheduler",
+    ):
+        TransformerConfig(**moonep_config_kwargs(**packing))
+    config = TransformerConfig(**moonep_config_kwargs())
+    config.sequence_packing_scheduler = "dp_balanced"
+    with pytest.raises(ValueError, match=PREFIX + "no sequence packing scheduler .*'dp_balanced'"):
+        config._validate_moonep()
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

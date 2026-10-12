@@ -68,13 +68,18 @@ class MoonEPDispatch(torch.autograd.Function):
         state,
         holder,
         plan,
+        total_num_tokens,
         wgrad,
         *params,
     ):
         # pylint: disable=missing-function-docstring
         if plan is None:
             hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
-                x.contiguous(), route_weights.contiguous(), topk_experts, tokens_per_expert,
+                x.contiguous(),
+                route_weights.contiguous(),
+                topk_experts,
+                tokens_per_expert, 
+                total_num_tokens=total_num_tokens, 
                 zero_copy=False,
             )
         else:
@@ -109,7 +114,7 @@ class MoonEPDispatch(torch.autograd.Function):
                 ctx.plan, ctx.params[:num_fc1], ctx.params[num_fc1:]
             )
         ctx.state.fwd_outstanding = False
-        return (grad_x, grad_route_weights_sk) + (None,) * 8 + tuple(param_grads)
+        return (grad_x, grad_route_weights_sk) + (None,) * 9 + tuple(param_grads)
 
 
 class MoonEPCombine(torch.autograd.Function):

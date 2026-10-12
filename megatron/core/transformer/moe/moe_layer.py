@@ -561,7 +561,12 @@ class MoELayer(BaseMoELayer):
         )
         return hidden_states, probs
 
-    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def dispatch(
+        self, 
+        hidden_states: torch.Tensor, 
+        probs: torch.Tensor, 
+        total_num_tokens: Optional[int] = None
+    ):
         """Dispatches tokens to assigned expert ranks via communication.
 
         This method performs the actual communication (e.g., All-to-All) to distribute
@@ -570,7 +575,8 @@ class MoELayer(BaseMoELayer):
         """
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
-        return self.token_dispatcher.token_dispatch(hidden_states, probs)
+        kwargs = {} if total_num_tokens is None else {'total_num_tokens': total_num_tokens}
+        return self.token_dispatcher.token_dispatch(hidden_states, probs, **kwargs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
@@ -687,6 +693,7 @@ class MoELayer(BaseMoELayer):
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        total_num_tokens: Optional[int] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -747,7 +754,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
+                dispatched_input, probs = self.dispatch(hidden_states, probs, total_num_tokens)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None

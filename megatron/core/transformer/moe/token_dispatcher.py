@@ -1967,6 +1967,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        total_num_tokens: Optional[int] = None,
     ):
         """
         Execute fused permutation and AlltoAll communication.
@@ -1987,9 +1988,15 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+        
+        kwargs = {} if total_num_tokens is None else {'total_num_tokens': total_num_tokens} 
         dispatched_hidden_states = self._comm_manager.dispatch(
-            hidden_states, async_finish, allocate_on_comm_stream
+            hidden_states, 
+            async_finish, 
+            allocate_on_comm_stream,
+            **kwargs,
         )
+        
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
